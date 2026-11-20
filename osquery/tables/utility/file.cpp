@@ -9,6 +9,7 @@
 
 #if !defined(WIN32)
 #include <sys/stat.h>
+#include <stdexcept>
 #else
 #include <shobjidl.h>
 
@@ -19,10 +20,13 @@
 #endif
 
 #include <osquery/core/system.h>
+#include <osquery/core/sql/column_dependencies.h>
 #include <osquery/core/tables.h>
 #include <osquery/filesystem/fileops.h>
 #include <osquery/filesystem/filesystem.h>
 #include <osquery/logger/logger.h>
+#include <osquery/core/sql/table_rows.h>
+#include <osquery/sql/lazy_table_row.h>
 #include <osquery/utils/scope_guard.h>
 #include <osquery/worker/ipc/platform_table_container_ipc.h>
 #include <osquery/worker/logging/glog/glog_logger.h>
@@ -32,6 +36,26 @@ namespace fs = boost::filesystem;
 namespace osquery {
 
 namespace tables {
+
+// The stat-based metadata columns all derive from a single lstat()/stat()
+// pair per path. Declaring them as a side effect group keeps the number of
+// syscalls identical whether the query selects one metadata column or all of
+// them; pruning only removes the group entirely for path-only queries.
+OSQUERY_REGISTER_COLUMN_DEPENDENCIES(
+    file,
+    {"inode", {"mode", "uid", "gid", "size", "device"}},
+    {"mode", {"inode"}},
+    {"uid", {"inode"}},
+    {"gid", {"inode"}},
+    {"size", {"inode"}},
+    {"device", {"inode"}},
+    {"block_size", {"inode"}},
+    {"hard_links", {"inode"}},
+    {"atime", {"inode"}},
+    {"mtime", {"inode"}},
+    {"ctime", {"inode"}},
+    {"symlink", {"symlink_target_path"}},
+    {"symlink_target_path", {"symlink"}});
 
 namespace {
 #ifdef WIN32
@@ -370,83 +394,145 @@ QueryData genFileWindows(QueryContext& context, Logger& logger) {
 
 #else
 
-void genFileInfoPosix(const fs::path& path,
-                      const fs::path& parent,
-                      const std::string& pattern,
-                      QueryData& results) {
-  // Must provide the path, filename, directory separate from boost path->string
-  // helpers to match any explicit (query-parsed) predicate constraints.
-  Row r;
-  r["path"] = path.string();
-  r["filename"] = path.filename().string();
-  r["directory"] = parent.string();
-  r["symlink"] = "0";
 
-  struct stat file_stat;
+TableRows genFilePosixRows(QueryContext& context) {
+  TableRows typed_results;
 
-  // On POSIX systems, first check the link state.
-  struct stat link_stat;
-  if (lstat(path.string().c_str(), &link_stat) < 0) {
-    // Path was not real, had too may links, or could not be accessed.
-    return;
-  }
-  if (S_ISLNK(link_stat.st_mode)) {
-    r["symlink"] = "1";
-    fs::path symlink_target = fs::read_symlink(path);
-    r["symlink_target_path"] = symlink_target.string();
-  }
+  auto append_lazy_row = [&context, &typed_results](
+                             fs::path path, fs::path parent) {
+    auto row = makeLazyTableRow(context.effectiveColsUsed);
+    row->setMetrics(context.metrics);
 
-  if (stat(path.string().c_str(), &file_stat)) {
-    file_stat = link_stat;
-  }
+    // Identity columns are free once the path has been resolved and are also
+    // needed to evaluate pushed-down predicates.
+    row->setColumn("path", [=] { return path.string(); });
+    row->setColumn("filename", [=] { return path.filename().string(); });
+    row->setColumn("directory", [=] { return parent.string(); });
 
-  r["inode"] = BIGINT(file_stat.st_ino);
-  r["uid"] = BIGINT(file_stat.st_uid);
-  r["gid"] = BIGINT(file_stat.st_gid);
-  r["mode"] = lsperms(file_stat.st_mode);
-  r["device"] = BIGINT(file_stat.st_rdev);
-  r["size"] = BIGINT(file_stat.st_size);
-  r["block_size"] = INTEGER(file_stat.st_blksize);
-  r["hard_links"] = INTEGER(file_stat.st_nlink);
+    // The whole metadata block is one side effect group: a single
+    // lstat()/stat() pair supplies it, and the registered dependency map
+    // forces every member in or out together.
+    auto link_stat = std::make_shared<struct stat>();
+    auto file_stat = std::make_shared<struct stat>();
+    auto stat_ok = std::make_shared<bool>(false);
 
-  r["atime"] = BIGINT(file_stat.st_atime);
-  r["mtime"] = BIGINT(file_stat.st_mtime);
-  r["ctime"] = BIGINT(file_stat.st_ctime);
+    auto ensure_stat = [=]() {
+      if (*stat_ok) {
+        return;
+      }
+      if (lstat(path.string().c_str(), link_stat.get()) < 0) {
+        throw std::runtime_error("cannot lstat path: " + path.string());
+      }
+      if (stat(path.string().c_str(), file_stat.get()) != 0) {
+        *file_stat = *link_stat;
+      }
+      *stat_ok = true;
+    };
 
+    row->setLazyColumn("symlink", [=]() -> std::string {
+      ensure_stat();
+      return S_ISLNK(link_stat->st_mode) ? "1" : "0";
+    });
+    row->setLazyColumn("symlink_target_path", [=]() -> std::string {
+      ensure_stat();
+      if (!S_ISLNK(link_stat->st_mode)) {
+        return {};
+      }
+      return fs::read_symlink(path).string();
+    });
+    row->setLazyColumn("inode",
+                       [=] {
+                         ensure_stat();
+                         return BIGINT(file_stat->st_ino);
+                       });
+    row->setLazyColumn("uid",
+                       [=] {
+                         ensure_stat();
+                         return BIGINT(file_stat->st_uid);
+                       });
+    row->setLazyColumn("gid",
+                       [=] {
+                         ensure_stat();
+                         return BIGINT(file_stat->st_gid);
+                       });
+    row->setLazyColumn("mode",
+                       [=] {
+                         ensure_stat();
+                         return lsperms(file_stat->st_mode);
+                       });
+    row->setLazyColumn("device",
+                       [=] {
+                         ensure_stat();
+                         return BIGINT(file_stat->st_rdev);
+                       });
+    row->setLazyColumn("size",
+                       [=] {
+                         ensure_stat();
+                         return BIGINT(file_stat->st_size);
+                       });
+    row->setLazyColumn("block_size",
+                       [=] {
+                         ensure_stat();
+                         return INTEGER(file_stat->st_blksize);
+                       });
+    row->setLazyColumn("hard_links",
+                       [=] {
+                         ensure_stat();
+                         return INTEGER(file_stat->st_nlink);
+                       });
+    row->setLazyColumn("atime",
+                       [=] {
+                         ensure_stat();
+                         return BIGINT(file_stat->st_atime);
+                       });
+    row->setLazyColumn("mtime",
+                       [=] {
+                         ensure_stat();
+                         return BIGINT(file_stat->st_mtime);
+                       });
+    row->setLazyColumn("ctime",
+                       [=] {
+                         ensure_stat();
+                         return BIGINT(file_stat->st_ctime);
+                       });
 #if defined(__linux__)
-  // No 'birth' or create time in Linux or Windows.
-  r["btime"] = "0";
-  r["pid_with_namespace"] = "0";
+    row->setLazyColumn("btime", [=] { return std::string("0"); });
+    row->setLazyColumn("pid_with_namespace",
+                       [=] { return std::string("0"); });
 #else
-  r["btime"] = BIGINT(file_stat.st_birthtimespec.tv_sec);
+    row->setLazyColumn("btime",
+                       [=] {
+                         ensure_stat();
+                         return BIGINT(file_stat->st_birthtimespec.tv_sec);
+                       });
 #endif
-
-  // Type booleans. A path whose status cannot be read gets the type "error",
-  // or "unknown" if it no longer exists.
-  boost::system::error_code ec;
-  auto status = fs::status(path, ec);
-  if (kTypeNames.count(status.type())) {
-    r["type"] = kTypeNames.at(status.type());
-  } else {
-    r["type"] = "unknown";
-  }
-
+    row->setLazyColumn("type",
+                       [=] {
+                         boost::system::error_code ec;
+                         auto status = fs::status(path, ec);
+                         return kTypeNames.count(status.type())
+                                    ? kTypeNames.at(status.type())
+                                    : std::string("unknown");
+                       });
 #if defined(__APPLE__)
-  std::string bsd_file_flags_description;
-  if (!describeBSDFileFlags(bsd_file_flags_description, file_stat.st_flags)) {
-    VLOG(1)
-        << "The following file had undocumented BSD file flags (chflags) set: "
-        << path;
-  }
-
-  r["bsd_flags"] = bsd_file_flags_description;
+    row->setLazyColumn("bsd_flags",
+                       [=] {
+                         ensure_stat();
+                         std::string flags;
+                         if (!describeBSDFileFlags(flags,
+                                                   file_stat->st_flags)) {
+                           VLOG(1)
+                               << "The following file had undocumented BSD "
+                                  "file flags set: "
+                               << path;
+                         }
+                         return flags;
+                       });
 #endif
 
-  results.push_back(r);
-}
-
-QueryData genFilePosix(QueryContext& context, Logger& logger) {
-  QueryData results;
+    typed_results.push_back(static_cast<TableRowHolder&&>(row));
+    context.recordRowGenerated();
+  };
 
   // Resolve file paths for EQUALS and LIKE operations.
   auto paths = getPathsFromConstraints(context);
@@ -454,7 +540,13 @@ QueryData genFilePosix(QueryContext& context, Logger& logger) {
   // Iterate through each of the resolved/supplied paths.
   for (const auto& path_string : paths) {
     fs::path path = path_string;
-    genFileInfoPosix(path, path.parent_path(), "", results);
+    // Match the legacy behavior: paths that cannot be stat'ed produce no row.
+    // Probe once here so the lazy row does not have to throw during xColumn.
+    struct stat probe;
+    if (lstat(path.string().c_str(), &probe) < 0) {
+      continue;
+    }
+    append_lazy_row(path, path.parent_path());
   }
 
   // Resolve directories for EQUALS and LIKE operations.
@@ -470,18 +562,23 @@ QueryData genFilePosix(QueryContext& context, Logger& logger) {
       // Iterate over the directory and generate info for each regular file.
       fs::directory_iterator begin(directory_string), end;
       for (; begin != end; ++begin) {
-        genFileInfoPosix(begin->path(), directory_string, "", results);
+        append_lazy_row(begin->path(), directory_string);
       }
     } catch (const fs::filesystem_error& /* e */) {
       continue;
     }
   }
 
-  return results;
+  return typed_results;
+}
+
+QueryData genFilePosix(QueryContext& context, Logger& logger) {
+  // Used by the namespace/worker IPC path, which exchanges string maps.
+  return tableRowsToQueryData(genFilePosixRows(context));
 }
 #endif
 
-QueryData genFileImpl(QueryContext& context, Logger& logger) {
+QueryData genFileImplQueryData(QueryContext& context, Logger& logger) {
 #ifdef WIN32
   return genFileWindows(context, logger);
 #else
@@ -489,13 +586,23 @@ QueryData genFileImpl(QueryContext& context, Logger& logger) {
 #endif
 }
 
-QueryData genFile(QueryContext& context) {
+TableRows genFile(QueryContext& context) {
+  // The namespace/worker path exchanges plain string maps over IPC and keeps
+  // the QueryData implementation; the normal in-process path returns lazy
+  // rows (built inside genFilePosix) so pruning can skip computations.
   if (hasNamespaceConstraint(context)) {
-    return generateInNamespace(context, "file", genFileImpl);
-  } else {
     GLOGLogger logger;
-    return genFileImpl(context, logger);
+    return tableRowsFromQueryData(
+        generateInNamespace(context, "file", genFileImplQueryData));
   }
+#ifdef WIN32
+  GLOGLogger logger;
+#endif
+#ifdef WIN32
+  return tableRowsFromQueryData(genFileWindows(context, logger));
+#else
+  return genFilePosixRows(context);
+#endif
 }
 } // namespace tables
 } // namespace osquery

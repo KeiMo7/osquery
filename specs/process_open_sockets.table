@@ -16,6 +16,7 @@ schema([
 extended_schema(LINUX, [
     Column("net_namespace", TEXT, "The inode number of the network namespace"),
 ])
+attributes(strongly_typed_rows=True)
 implementation("system/process_open_sockets@genOpenSockets")
 examples([
   "select * from process_open_sockets where pid = 1",

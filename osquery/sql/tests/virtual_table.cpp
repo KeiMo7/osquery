@@ -9,12 +9,16 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+
 #include <osquery/core/core.h>
+#include <osquery/core/sql/column_dependencies.h>
 #include <osquery/core/system.h>
 #include <osquery/database/database.h>
 #include <osquery/logger/logger.h>
 #include <osquery/registry/registry.h>
 #include <osquery/sql/dynamic_table_row.h>
+#include <osquery/sql/lazy_table_row.h>
 #include <osquery/sql/sql.h>
 
 #include <osquery/sql/virtual_table.h>
@@ -1419,6 +1423,379 @@ TEST_F(VirtualTableTests, test_table_doc_hint) {
   auto hint = tables::sqlite::getTableDocHint("doc_hint_extension_table");
   EXPECT_EQ(hint.find("osquery.io"), std::string::npos) << hint;
   EXPECT_NE(hint.find("provided by an extension"), std::string::npos) << hint;
+}
+
+DECLARE_bool(enable_column_pruning);
+
+class ColumnPruningFlagGuard {
+ public:
+  ColumnPruningFlagGuard() : saved_(FLAGS_enable_column_pruning) {}
+  ~ColumnPruningFlagGuard() {
+    FLAGS_enable_column_pruning = saved_;
+  }
+
+ private:
+  bool saved_;
+};
+
+/// Instrumented table counting how often each column computation runs.
+class pruningTablePlugin : public TablePlugin {
+ public:
+  pruningTablePlugin() {
+    computed.fill(0);
+  }
+
+  TableColumns columns() const override {
+    return {
+        std::make_tuple("id", INTEGER_TYPE, ColumnOptions::INDEX),
+        std::make_tuple("cheap", TEXT_TYPE, ColumnOptions::DEFAULT),
+        std::make_tuple("expensive", TEXT_TYPE, ColumnOptions::DEFAULT),
+        std::make_tuple("derived", TEXT_TYPE, ColumnOptions::DEFAULT),
+    };
+  }
+
+  ColumnDependencyMap columnDependencies() const override {
+    // `derived` shares the expensive computation (side effect group).
+    return {
+        {"derived", {"expensive"}},
+        {"expensive", {"derived"}},
+    };
+  }
+
+  TableRows generate(QueryContext& context) override {
+    ++scans;
+    auto row = makeLazyTableRow(context.effectiveColsUsed);
+    row->setMetrics(context.metrics);
+
+    for (size_t i = 0; i < computed.size(); ++i) {
+      const std::string name = columnNames[i];
+      row->setLazyColumn(name, [this, i, name] {
+        ++computed[i];
+        return name + "_value";
+      });
+    }
+
+    TableRows rows;
+    rows.push_back(static_cast<TableRowHolder&&>(row));
+    return rows;
+  }
+
+  size_t scans{0};
+  std::array<size_t, 4> computed;
+  static constexpr const char* columnNames[4] = {
+      "id", "cheap", "expensive", "derived"};
+};
+
+TEST_F(VirtualTableTests, test_column_pruning_disabled_by_default) {
+  FLAGS_enable_column_pruning = false;
+  ColumnPruningFlagGuard flag_guard;
+  auto tables = RegistryFactory::get().registry("table");
+  auto table = std::make_shared<pruningTablePlugin>();
+  tables->add("pruning_off", table);
+  auto dbc = SQLiteDBManager::getUnique();
+  attachTableInternal("pruning_off", dbc, false);
+
+  QueryData results;
+  auto status = queryInternal(
+      "SELECT id, cheap FROM pruning_off WHERE id = 1", results, dbc);
+  ASSERT_TRUE(status.ok());
+  ASSERT_EQ(1U, results.size());
+  // With the switch off every column is computed, matching legacy behavior.
+  for (auto count : table->computed) {
+    EXPECT_EQ(1U, count);
+  }
+}
+
+TEST_F(VirtualTableTests, test_column_pruning_skips_unrequested_columns) {
+  FLAGS_enable_column_pruning = true;
+  ColumnPruningFlagGuard flag_guard;
+  auto tables = RegistryFactory::get().registry("table");
+  auto table = std::make_shared<pruningTablePlugin>();
+  tables->add("pruning_on", table);
+  auto dbc = SQLiteDBManager::getUnique();
+  attachTableInternal("pruning_on", dbc, false);
+
+  QueryData results;
+  auto status =
+      queryInternal("SELECT id, cheap FROM pruning_on", results, dbc);
+  ASSERT_TRUE(status.ok());
+  ASSERT_EQ(1U, results.size());
+  EXPECT_EQ(1U, table->computed[0]); // id
+  EXPECT_EQ(1U, table->computed[1]); // cheap
+  EXPECT_EQ(0U, table->computed[2]); // expensive skipped
+  EXPECT_EQ(0U, table->computed[3]); // derived skipped
+  // Skipped columns materialize as absent/NULL.
+  EXPECT_EQ(results[0].find("expensive"), results[0].end());
+}
+
+TEST_F(VirtualTableTests, test_column_pruning_side_effect_group) {
+  FLAGS_enable_column_pruning = true;
+  ColumnPruningFlagGuard flag_guard;
+  auto tables = RegistryFactory::get().registry("table");
+  auto table = std::make_shared<pruningTablePlugin>();
+  tables->add("pruning_group", table);
+  auto dbc = SQLiteDBManager::getUnique();
+  attachTableInternal("pruning_group", dbc, false);
+
+  QueryData results;
+  // Requesting only `derived` must pull in the whole side effect group.
+  auto status =
+      queryInternal("SELECT derived FROM pruning_group", results, dbc);
+  ASSERT_TRUE(status.ok());
+  ASSERT_EQ(1U, results.size());
+  EXPECT_EQ(1U, table->computed[2]);
+  EXPECT_EQ(1U, table->computed[3]);
+  EXPECT_EQ(0U, table->computed[1]);
+}
+
+TEST_F(VirtualTableTests, test_column_pruning_keeps_constraint_columns) {
+  FLAGS_enable_column_pruning = true;
+  ColumnPruningFlagGuard flag_guard;
+  auto tables = RegistryFactory::get().registry("table");
+  auto table = std::make_shared<pruningTablePlugin>();
+  tables->add("pruning_constraint", table);
+  auto dbc = SQLiteDBManager::getUnique();
+  attachTableInternal("pruning_constraint", dbc, false);
+
+  QueryData results;
+  // `id` is constrained but not selected; it must still be computed so the
+  // retained SQLite predicate can be evaluated correctly.
+  auto status = queryInternal(
+      "SELECT cheap FROM pruning_constraint WHERE id = 1", results, dbc);
+  ASSERT_TRUE(status.ok());
+  ASSERT_EQ(1U, results.size());
+  EXPECT_EQ(1U, table->computed[0]);
+  EXPECT_EQ(1U, table->computed[1]);
+}
+
+TEST_F(VirtualTableTests, test_column_pruning_join_separate_requirements) {
+  FLAGS_enable_column_pruning = true;
+  ColumnPruningFlagGuard flag_guard;
+  auto tables = RegistryFactory::get().registry("table");
+  auto left = std::make_shared<pruningTablePlugin>();
+  auto right = std::make_shared<pruningTablePlugin>();
+  tables->add("pruning_join_l", left);
+  tables->add("pruning_join_r", right);
+  auto dbc = SQLiteDBManager::getUnique();
+  attachTableInternal("pruning_join_l", dbc, false);
+  attachTableInternal("pruning_join_r", dbc, false);
+
+  QueryData results;
+  auto status = queryInternal(
+      "SELECT l.cheap, r.expensive FROM pruning_join_l l "
+      "JOIN pruning_join_r r ON l.id = r.id",
+      results,
+      dbc);
+  ASSERT_TRUE(status.ok());
+  // Each table gets its own column requirements rather than the union.
+  EXPECT_EQ(1U, left->computed[1]);
+  EXPECT_EQ(0U, left->computed[2]);
+  EXPECT_EQ(0U, right->computed[1]);
+  EXPECT_EQ(1U, right->computed[2]);
+}
+
+TEST_F(VirtualTableTests, test_column_pruning_subquery_merges_scans) {
+  FLAGS_enable_column_pruning = true;
+  ColumnPruningFlagGuard flag_guard;
+  auto tables = RegistryFactory::get().registry("table");
+  auto table = std::make_shared<pruningTablePlugin>();
+  tables->add("pruning_sub", table);
+  auto dbc = SQLiteDBManager::getUnique();
+  attachTableInternal("pruning_sub", dbc, false);
+
+  QueryData results;
+  // Two scans of the same table with different needs: each scan computes
+  // only its own effective set, and no row is materialized twice within a
+  // scan to satisfy the other scope.
+  auto status = queryInternal(
+      "SELECT cheap FROM pruning_sub WHERE id IN "
+      "(SELECT id FROM pruning_sub WHERE expensive = 'expensive_value')",
+      results,
+      dbc);
+  ASSERT_TRUE(status.ok());
+  EXPECT_GE(table->scans, 2U);
+  // Both cheap and expensive got computed at least once across scans, but
+  // every individual scan stayed within its own requirements.
+  EXPECT_GE(table->computed[1], 1U);
+  EXPECT_GE(table->computed[2], 1U);
+}
+
+TEST_F(VirtualTableTests, test_column_pruning_aggregate_needs_no_columns) {
+  FLAGS_enable_column_pruning = true;
+  ColumnPruningFlagGuard flag_guard;
+  auto tables = RegistryFactory::get().registry("table");
+  auto table = std::make_shared<pruningTablePlugin>();
+  tables->add("pruning_agg", table);
+  auto dbc = SQLiteDBManager::getUnique();
+  attachTableInternal("pruning_agg", dbc, false);
+
+  QueryData results;
+  auto status =
+      queryInternal("SELECT COUNT(*) FROM pruning_agg", results, dbc);
+  ASSERT_TRUE(status.ok());
+  ASSERT_EQ(1U, results.size());
+  ASSERT_EQ(1U, results[0].size());
+  EXPECT_EQ("1", results[0].begin()->second);
+  for (auto count : table->computed) {
+    EXPECT_EQ(0U, count);
+  }
+}
+
+/// A table whose lazy column throws; errors must name the column.
+class throwingColumnTablePlugin : public TablePlugin {
+  TableColumns columns() const override {
+    return {
+        std::make_tuple("id", INTEGER_TYPE, ColumnOptions::DEFAULT),
+        std::make_tuple("boom", TEXT_TYPE, ColumnOptions::DEFAULT),
+    };
+  }
+
+  TableRows generate(QueryContext& context) override {
+    auto row = makeLazyTableRow(context.effectiveColsUsed);
+    row->setColumn("id", [] { return std::string("1"); });
+    row->setLazyColumn("boom",
+                       []() -> std::string {
+                         throw std::runtime_error("synthetic failure");
+                       });
+    TableRows rows;
+    rows.push_back(static_cast<TableRowHolder&&>(row));
+    return rows;
+  }
+};
+
+TEST_F(VirtualTableTests, test_column_pruning_exception_attribution) {
+  FLAGS_enable_column_pruning = true;
+  ColumnPruningFlagGuard flag_guard;
+  auto backup_ignore = FLAGS_ignore_table_exceptions;
+  FLAGS_ignore_table_exceptions = false;
+  auto tables = RegistryFactory::get().registry("table");
+  tables->add("pruning_throw", std::make_shared<throwingColumnTablePlugin>());
+  auto dbc = SQLiteDBManager::getUnique();
+  attachTableInternal("pruning_throw", dbc, false);
+
+  QueryData results;
+  // The exception message must identify the failing column.
+  EXPECT_THROW(
+      {
+        try {
+          queryInternal("SELECT boom FROM pruning_throw", results, dbc);
+        } catch (const std::runtime_error& e) {
+          EXPECT_NE(std::string(e.what()).find("boom"), std::string::npos);
+          throw;
+        }
+      },
+      std::runtime_error);
+
+  // Selecting only the healthy column must not trigger the throwing one.
+  QueryData healthy;
+  auto status =
+      queryInternal("SELECT id FROM pruning_throw", healthy, dbc);
+  ASSERT_TRUE(status.ok());
+  ASSERT_EQ(1U, healthy.size());
+  FLAGS_ignore_table_exceptions = backup_ignore;
+}
+
+TEST_F(VirtualTableTests, test_dependency_closure_and_registry) {
+  ColumnDependencyMap dependencies{
+      {"a", {"b"}},
+      {"b", {"c"}},
+      {"x", {"y"}},
+      {"y", {"x"}},
+  };
+
+  auto closure = expandColumnDependencies(UsedColumns{"a"}, dependencies);
+  EXPECT_EQ(3U, closure.size());
+  EXPECT_EQ(1U, closure.count("b"));
+  EXPECT_EQ(1U, closure.count("c"));
+
+  auto group = expandColumnDependencies(UsedColumns{"x"}, dependencies);
+  EXPECT_EQ(2U, group.size());
+
+  // Registry round-trip used by real table implementations.
+  ColumnDependencyRegistry::instance().add(
+      "registry_probe", ColumnDependencyMap{{"p", {"q"}}});
+  auto stored = ColumnDependencyRegistry::instance().get("registry_probe");
+  EXPECT_EQ(1U, stored.at("p").size());
+  EXPECT_EQ(0U,
+            ColumnDependencyRegistry::instance().get("missing").size());
+}
+
+/// Emulates a table enumerating an expensive input set; it must only emit
+/// rows for the pushed-down equality constraint rather than filtering after.
+class pushdownTablePlugin : public TablePlugin {
+  TableColumns columns() const override {
+    return {
+        std::make_tuple("key", TEXT_TYPE, ColumnOptions::INDEX),
+        std::make_tuple("payload", TEXT_TYPE, ColumnOptions::DEFAULT),
+    };
+  }
+
+  TableRows generate(QueryContext& context) override {
+    ++scans;
+    TableRows rows;
+    auto wanted = context.constraints["key"].getAll(EQUALS);
+    if (wanted.empty()) {
+      // No usable predicate: the table falls back to a full enumeration.
+      for (const auto& key : universe) {
+        auto row = make_table_row();
+        row["key"] = key;
+        row["payload"] = "p-" + key;
+        rows.push_back(std::move(row));
+        ++emitted;
+      }
+      return rows;
+    }
+    for (const auto& key : wanted) {
+      auto row = make_table_row();
+      row["key"] = key;
+      row["payload"] = "p-" + key;
+      rows.push_back(std::move(row));
+      ++emitted;
+    }
+    return rows;
+  }
+
+ public:
+  size_t scans{0};
+  size_t emitted{0};
+  const std::vector<std::string> universe{"a", "b", "c", "d", "e"};
+};
+
+TEST_F(VirtualTableTests, test_predicate_pushdown_reduces_generated_rows) {
+  auto tables = RegistryFactory::get().registry("table");
+  auto table = std::make_shared<pushdownTablePlugin>();
+  tables->add("pushdown", table);
+  auto dbc = SQLiteDBManager::getUnique();
+  attachTableInternal("pushdown", dbc, false);
+
+  QueryData full;
+  ASSERT_TRUE(
+      queryInternal("SELECT * FROM pushdown", full, dbc).ok());
+  EXPECT_EQ(5U, full.size());
+  EXPECT_EQ(1U, table->scans);
+  EXPECT_EQ(5U, table->emitted);
+
+  QueryData filtered;
+  ASSERT_TRUE(queryInternal(
+                  "SELECT payload FROM pushdown WHERE key = 'c'",
+                  filtered,
+                  dbc)
+                  .ok());
+  ASSERT_EQ(1U, filtered.size());
+  EXPECT_EQ("p-c", filtered[0].at("payload"));
+  // The table generated exactly the matching row instead of all five.
+  EXPECT_EQ(6U, table->emitted);
+
+  // An unsupported predicate is retained by SQLite and never leaks rows:
+  // LIKE on a non-indexed column still yields the correct filtered set.
+  QueryData like_filtered;
+  ASSERT_TRUE(queryInternal(
+                  "SELECT key FROM pushdown WHERE payload LIKE 'p-a'",
+                  like_filtered,
+                  dbc)
+                  .ok());
+  ASSERT_EQ(1U, like_filtered.size());
+  EXPECT_EQ("a", like_filtered[0].at("key"));
 }
 
 } // namespace osquery

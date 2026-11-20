@@ -12,6 +12,7 @@
 
 #include <osquery/core/tables.h>
 #include <osquery/logger/logger.h>
+#include <osquery/sql/dynamic_table_row.h>
 
 #include "win_sockets.h"
 
@@ -292,7 +293,7 @@ void* WinSockets::allocateSocketTable(unsigned long protocol,
   return pSockTable;
 }
 
-QueryData genOpenSockets(QueryContext& context) {
+TableRows genOpenSockets(QueryContext& context) {
   QueryData results;
   WinSockets sockTable;
 
@@ -304,7 +305,7 @@ QueryData genOpenSockets(QueryContext& context) {
 
   sockTable.parseSocketTable(WinSockTableType::udp6, results);
 
-  return results;
+  return tableRowsFromQueryData(std::move(results));
 }
 } // namespace tables
 } // namespace osquery

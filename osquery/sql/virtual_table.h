@@ -58,6 +58,9 @@ struct BaseCursor : private boost::noncopyable {
 
   /// Total number of rows.
   size_t n{0};
+
+  /// Optional per-scan metrics, retained for generator-based tables.
+  std::shared_ptr<TableQueryMetrics> metrics;
 };
 
 /**

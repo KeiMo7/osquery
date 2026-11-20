@@ -35,4 +35,13 @@ Status serializeTableRowsJSON(const TableRows& rows, std::string& json) {
   return doc.toString(json);
 }
 
+QueryData tableRowsToQueryData(const TableRows& rows) {
+  QueryData result;
+  result.reserve(rows.size());
+  for (const auto& row : rows) {
+    result.push_back(static_cast<Row>(*row));
+  }
+  return result;
+}
+
 } // namespace osquery

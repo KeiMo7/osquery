@@ -47,4 +47,7 @@ Status deserializeTableRows(const rapidjson::Value& arr, TableRows& rows);
 /// Inverse of serializeTableRowsJSON, convert a JSON string to TableRows.
 Status deserializeTableRowsJSON(const std::string& json, TableRows& rows);
 
+/// Materialize potentially-lazy rows into plain QueryData string maps.
+QueryData tableRowsToQueryData(const TableRows& rows);
+
 } // namespace osquery

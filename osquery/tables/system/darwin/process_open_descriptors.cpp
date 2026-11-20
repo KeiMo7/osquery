@@ -17,6 +17,7 @@
 #include <osquery/core/core.h>
 #include <osquery/core/tables.h>
 #include <osquery/logger/logger.h>
+#include <osquery/sql/dynamic_table_row.h>
 
 namespace osquery {
 namespace tables {
@@ -222,7 +223,7 @@ void genOpenDescriptors(int pid, descriptor_type type, QueryData& results) {
   }
 }
 
-QueryData genOpenSockets(QueryContext& context) {
+TableRows genOpenSockets(QueryContext& context) {
   QueryData results;
 
   auto pidlist = getProcList(context);
@@ -234,7 +235,7 @@ QueryData genOpenSockets(QueryContext& context) {
     genOpenDescriptors(pid, DESCRIPTORS_TYPE_SOCKET, results);
   }
 
-  return results;
+  return tableRowsFromQueryData(std::move(results));
 }
 
 QueryData genOpenFiles(QueryContext& context) {

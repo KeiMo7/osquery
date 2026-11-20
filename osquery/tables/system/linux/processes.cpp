@@ -23,11 +23,12 @@
 #include <boost/noncopyable.hpp>
 
 #include <osquery/core/core.h>
+#include <osquery/core/sql/column_dependencies.h>
 #include <osquery/core/tables.h>
 #include <osquery/filesystem/filesystem.h>
 #include <osquery/filesystem/linux/proc.h>
 #include <osquery/logger/logger.h>
-#include <osquery/sql/dynamic_table_row.h>
+#include <osquery/sql/lazy_table_row.h>
 #include <osquery/tables/system/linux/processes.h>
 #include <osquery/utils/conversions/split.h>
 #include <osquery/utils/system/boottime.h>
@@ -38,6 +39,19 @@ namespace osquery {
 namespace tables {
 
 const int kMSIn1CLKTCK = (1000 / sysconf(_SC_CLK_TCK));
+
+// Column relationships for the processes table.
+//
+// `on_disk` reuses the readlink() result materialized for `path`, so pruning
+// must never compute on_disk without path. The two disk_bytes_* columns come
+// from a single read of /proc/<pid>/io and form a side effect group: the io
+// file is parsed once and both fields derive from it. Requesting either keeps
+// the pair identical to the unpruned, single-read implementation.
+OSQUERY_REGISTER_COLUMN_DEPENDENCIES(
+    processes,
+    {"on_disk", {"path"}},
+    {"disk_bytes_read", {"disk_bytes_written"}},
+    {"disk_bytes_written", {"disk_bytes_read"}});
 
 inline std::string getProcAttr(const std::string& attr,
                                const std::string& pid) {
@@ -495,75 +509,124 @@ void genProcess(const std::string& pid,
                 QueryContext& context,
                 TableRows& results) {
   // Parse the process stat and status.
-  SimpleProcStat proc_stat(pid);
-  // Parse the process io
-  SimpleProcIo proc_io(pid);
+  auto stat_holder =
+      std::shared_ptr<SimpleProcStat>(new SimpleProcStat(pid));
+  SimpleProcStat& proc_stat = *stat_holder;
 
   if (!proc_stat.status.ok()) {
     VLOG(1) << proc_stat.status.getMessage() << " for pid " << pid;
     return;
   }
 
-  auto r = make_table_row();
-  r["pid"] = pid;
-  r["parent"] = proc_stat.parent;
-  r["path"] = readProcLink("exe", pid);
-  r["name"] = proc_stat.name;
-  r["pgroup"] = proc_stat.group;
-  r["state"] = proc_stat.state;
-  r["nice"] = proc_stat.nice;
-  r["threads"] = proc_stat.threads;
-  // Read/parse cmdline arguments.
-  r["cmdline"] = readProcCMDLine(pid);
-  if (context.isColumnUsed("cgroup_path")) {
-    r["cgroup_path"] = readProcCgroup(pid);
-  }
-  r["cwd"] = readProcLink("cwd", pid);
-  r["root"] = readProcLink("root", pid);
-  r["uid"] = proc_stat.real_uid;
-  r["euid"] = proc_stat.effective_uid;
-  r["suid"] = proc_stat.saved_uid;
-  r["gid"] = proc_stat.real_gid;
-  r["egid"] = proc_stat.effective_gid;
-  r["sgid"] = proc_stat.saved_gid;
-  r["label"] = readSecurityLabel(pid);
+  auto r = makeLazyTableRow(context.effectiveColsUsed);
+  r->setMetrics(context.metrics);
+  // Lazy callbacks outlive this function, so capture per-process state by
+  // shared ownership rather than by reference.
+  auto boot_time = std::make_shared<std::uint64_t>(system_boot_time);
+  auto pid_holder = std::make_shared<std::string>(pid);
 
-  r["on_disk"] = INTEGER(getOnDisk(pid, r["path"]));
+  // Cheap columns derived from the already-parsed stat/status structures are
+  // computed eagerly: they preserve the original row assembly ordering and
+  // avoid extra per-column indirection.
+  r->setColumn("pid", [=] { return *pid_holder; });
+  r->setColumn("parent", [=] { return stat_holder->parent; });
+  r->setColumn("name", [=] { return stat_holder->name; });
+  r->setColumn("pgroup", [=] { return stat_holder->group; });
+  r->setColumn("state", [=] { return stat_holder->state; });
+  r->setColumn("nice", [=] { return stat_holder->nice; });
+  r->setColumn("threads", [=] { return stat_holder->threads; });
+  r->setColumn("uid", [=] { return stat_holder->real_uid; });
+  r->setColumn("euid", [=] { return stat_holder->effective_uid; });
+  r->setColumn("suid", [=] { return stat_holder->saved_uid; });
+  r->setColumn("gid", [=] { return stat_holder->real_gid; });
+  r->setColumn("egid", [=] { return stat_holder->effective_gid; });
+  r->setColumn("sgid", [=] { return stat_holder->saved_gid; });
+  r->setColumn("wired_size", [&] {
+    return std::string("0"); // No unpagable counters on Linux.
+  });
+  r->setColumn("resident_size", [=] { return stat_holder->resident_size; });
+  r->setColumn("total_size", [=] { return stat_holder->total_size; });
+  r->setColumn("user_time", [&] {
+    auto usr_time =
+        std::strtoull(stat_holder->user_time.data(), nullptr, 10);
+    return std::to_string(usr_time * kMSIn1CLKTCK);
+  });
+  r->setColumn("system_time", [&] {
+    auto sys_time =
+        std::strtoull(stat_holder->system_time.data(), nullptr, 10);
+    return std::to_string(sys_time * kMSIn1CLKTCK);
+  });
+  r->setColumn("start_time", [=] {
+    auto proc_start_time_exp = tryTo<long>(stat_holder->start_time);
+    if (proc_start_time_exp.isValue() && *boot_time > 0) {
+      auto proc_start_time =
+          proc_start_time_exp.take() / sysconf(_SC_CLK_TCK);
+      return BIGINT(*boot_time + proc_start_time);
+    }
+    return std::string("-1");
+  });
 
-  // size/memory information
-  r["wired_size"] = "0"; // No support for unpagable counters in linux.
-  r["resident_size"] = proc_stat.resident_size;
-  r["total_size"] = proc_stat.total_size;
+  // Expensive columns: each performs at least one file read or readlink per
+  // process. They are registered lazily and only evaluated when the effective
+  // used set requires them, which is the core of the column pruning win.
+  // path and on_disk share one readlink() result, exactly like the legacy
+  // row that computed on_disk from the already-populated r["path"].
+  auto exe_path = std::make_shared<std::string>();
+  auto exe_path_loaded = std::make_shared<bool>(false);
+  auto load_exe_path = [=] {
+    if (!*exe_path_loaded) {
+      *exe_path = readProcLink("exe", *pid_holder);
+      *exe_path_loaded = true;
+    }
+  };
+  r->setLazyColumn("path", [=] {
+    load_exe_path();
+    return *exe_path;
+  });
+  r->setLazyColumn("cmdline",
+                   [=] { return readProcCMDLine(*pid_holder); });
+  r->setLazyColumn("cgroup_path",
+                   [=] { return readProcCgroup(*pid_holder); });
+  r->setLazyColumn("cwd",
+                   [=] { return readProcLink("cwd", *pid_holder); });
+  r->setLazyColumn("root",
+                   [=] { return readProcLink("root", *pid_holder); });
+  r->setLazyColumn("label",
+                   [=] { return readSecurityLabel(*pid_holder); });
 
-  // time information
-  auto usr_time = std::strtoull(proc_stat.user_time.data(), nullptr, 10);
-  r["user_time"] = std::to_string(usr_time * kMSIn1CLKTCK);
-  auto sys_time = std::strtoull(proc_stat.system_time.data(), nullptr, 10);
-  r["system_time"] = std::to_string(sys_time * kMSIn1CLKTCK);
+  // on_disk depends on path per the registered dependency map; the shared
+  // path value is read once and reused, matching the original implementation.
+  r->setLazyColumn("on_disk", [=]() {
+    load_exe_path();
+    return INTEGER(getOnDisk(*pid_holder, *exe_path));
+  });
 
-  auto proc_start_time_exp = tryTo<long>(proc_stat.start_time);
-  if (proc_start_time_exp.isValue() && system_boot_time > 0) {
-    auto proc_start_time = proc_start_time_exp.take() / sysconf(_SC_CLK_TCK);
-
-    r["start_time"] = BIGINT(system_boot_time + proc_start_time);
-  } else {
-    r["start_time"] = "-1";
-  }
-
-  if (!proc_io.status.ok()) {
-    // /proc/<pid>/io can require root to access, so don't fail if we can't
-    VLOG(1) << proc_io.status.getMessage();
-  } else {
-    r["disk_bytes_read"] = proc_io.read_bytes;
-    long long write_bytes = tryTo<long long>(proc_io.write_bytes).takeOr(0ll);
+  // Side effect group: a single /proc/<pid>/io parse feeds both columns.
+  // The shared provider is captured by reference so only the first requested
+  // member pays the file read; the dependency registration guarantees both
+  // members are in the effective set together.
+  auto io_data = std::shared_ptr<SimpleProcIo>(new SimpleProcIo(pid));
+  const Status io_status = io_data->status;
+  r->setLazyColumn("disk_bytes_read", [=]() -> std::string {
+    if (!io_status.ok()) {
+      VLOG(1) << io_status.getMessage();
+      return {};
+    }
+    return io_data->read_bytes;
+  });
+  r->setLazyColumn("disk_bytes_written", [=]() -> std::string {
+    if (!io_status.ok()) {
+      return {};
+    }
+    long long write_bytes =
+        tryTo<long long>(io_data->write_bytes).takeOr(0ll);
     long long cancelled_write_bytes =
-        tryTo<long long>(proc_io.cancelled_write_bytes).takeOr(0ll);
+        tryTo<long long>(io_data->cancelled_write_bytes).takeOr(0ll);
+    return std::to_string(write_bytes - cancelled_write_bytes);
+  });
 
-    r["disk_bytes_written"] =
-        std::to_string(write_bytes - cancelled_write_bytes);
-  }
-
-  results.push_back(r);
+  results.push_back(static_cast<TableRowHolder&&>(r));
+  context.recordRowGenerated();
 }
 
 void genNamespaces(const std::string& pid, QueryData& results) {

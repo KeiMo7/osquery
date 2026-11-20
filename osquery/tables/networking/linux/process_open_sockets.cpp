@@ -8,16 +8,31 @@
  */
 
 #include <osquery/core/core.h>
+#include <osquery/core/sql/column_dependencies.h>
 #include <osquery/core/tables.h>
 #include <osquery/filesystem/filesystem.h>
 #include <osquery/filesystem/linux/proc.h>
+#include <osquery/sql/lazy_table_row.h>
 
 namespace osquery {
 namespace tables {
 
-QueryData genOpenSockets(QueryContext& context) {
+// The address/port pairs are produced from the same parsed /proc/net entries;
+// declaring them as a group prevents splitting one parse across partially
+// requested rows while still allowing path-only UNIX socket queries to skip
+// the network fields entirely.
+OSQUERY_REGISTER_COLUMN_DEPENDENCIES(
+    process_open_sockets,
+    {"local_address", {"local_port"}},
+    {"local_port", {"local_address"}},
+    {"remote_address", {"remote_port"}},
+    {"remote_port", {"remote_address"}},
+    {"family", {"protocol"}},
+    {"protocol", {"family"}});
+
+TableRows genOpenSockets(QueryContext& context) {
   Status status;
-  QueryData results;
+  TableRows results;
 
   /*
    * If filtering by pid, restrict results to the list of pids provided
@@ -141,32 +156,50 @@ QueryData genOpenSockets(QueryContext& context) {
    * the inode to process information map.
    */
   for (const auto& info : socket_list) {
-    Row r;
+    auto r = makeLazyTableRow(context.effectiveColsUsed);
+    r->setMetrics(context.metrics);
     auto proc_it = inode_proc_map.find(info.socket);
     if (proc_it != inode_proc_map.end()) {
-      r["pid"] = proc_it->second.pid;
-      r["fd"] = proc_it->second.fd;
+      const auto pid = proc_it->second.pid;
+      const auto fd = proc_it->second.fd;
+      r->setColumn("pid", [=] { return pid; });
+      r->setColumn("fd", [=] { return fd; });
     } else if (!pid_filter) {
-      r["pid"] = "-1";
-      r["fd"] = "-1";
+      r->setColumn("pid", [] { return std::string("-1"); });
+      r->setColumn("fd", [] { return std::string("-1"); });
     } else {
       /* If we're filtering by pid we only care about sockets associated with
        * pids on the list.*/
       continue;
     }
 
-    r["socket"] = info.socket;
-    r["family"] = std::to_string(info.family);
-    r["protocol"] = std::to_string(info.protocol);
-    r["local_address"] = info.local_address;
-    r["local_port"] = std::to_string(info.local_port);
-    r["remote_address"] = info.remote_address;
-    r["remote_port"] = std::to_string(info.remote_port);
-    r["path"] = info.unix_socket_path;
-    r["state"] = info.state;
-    r["net_namespace"] = std::to_string(info.net_ns);
+    const auto socket = info.socket;
+    const auto family = info.family;
+    const auto protocol = info.protocol;
+    const auto local_address = info.local_address;
+    const auto local_port = info.local_port;
+    const auto remote_address = info.remote_address;
+    const auto remote_port = info.remote_port;
+    const auto unix_path = info.unix_socket_path;
+    const auto state = info.state;
+    const auto net_namespace = info.net_ns;
 
-    results.push_back(std::move(r));
+    r->setColumn("socket", [=] { return socket; });
+    r->setLazyColumn("family", [=] { return std::to_string(family); });
+    r->setLazyColumn("protocol", [=] { return std::to_string(protocol); });
+    r->setLazyColumn("local_address", [=] { return local_address; });
+    r->setLazyColumn("local_port",
+                     [=] { return std::to_string(local_port); });
+    r->setLazyColumn("remote_address", [=] { return remote_address; });
+    r->setLazyColumn("remote_port",
+                     [=] { return std::to_string(remote_port); });
+    r->setLazyColumn("path", [=] { return unix_path; });
+    r->setLazyColumn("state", [=] { return state; });
+    r->setLazyColumn("net_namespace",
+                     [=] { return std::to_string(net_namespace); });
+
+    results.push_back(static_cast<TableRowHolder&&>(r));
+    context.recordRowGenerated();
   }
 
   return results;

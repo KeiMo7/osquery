@@ -22,6 +22,12 @@ namespace osquery {
 
 FLAG(bool, disable_caching, false, "Disable scheduled query caching");
 
+FLAG(bool,
+     enable_column_pruning,
+     false,
+     "Allow table implementations to skip columns that the query does not "
+     "reference. Disabled preserves the historical full-column computation.");
+
 CREATE_LAZY_REGISTRY(TablePlugin, "table");
 
 uint64_t TablePlugin::kCacheInterval = 0;
@@ -539,6 +545,36 @@ bool QueryContext::defaultColumnsUsed() const {
   return !colsUsedBitset || *colsUsedBitset == mask;
 }
 
+bool QueryContext::isColumnRequired(const std::string& colName) const {
+  if (!effectiveColsUsed) {
+    // Pruning disabled or unknown: preserve the full-computation behavior.
+    return true;
+  }
+  return effectiveColsUsed->find(colName) != effectiveColsUsed->end();
+}
+
+bool QueryContext::isAnyColumnRequired(
+    std::initializer_list<std::string> colNames) const {
+  for (const auto& colName : colNames) {
+    if (isColumnRequired(colName)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void QueryContext::recordColumnComputed() const {
+  if (metrics) {
+    ++metrics->columns_computed;
+  }
+}
+
+void QueryContext::recordRowGenerated() const {
+  if (metrics) {
+    ++metrics->rows_generated;
+  }
+}
+
 void QueryContext::useCache(bool use_cache) {
   use_cache_ = use_cache;
 }
@@ -649,6 +685,73 @@ void serializeQueryContextJSON(const QueryContext& context, JSON& json_helper) {
   if (context.colsUsedBitset) {
     json_helper.addCopy("colsUsedBitset", context.colsUsedBitset->to_ullong());
   }
+}
+
+UsedColumns expandColumnDependencies(
+    const UsedColumns& requested,
+    const ColumnDependencyMap& dependencies) {
+  UsedColumns effective = requested;
+
+  // Fixed-point closure: a dependency may itself declare dependencies, and
+  // symmetric declarations describe side effect groups that must be pulled
+  // in as a whole.
+  bool grew = true;
+  while (grew) {
+    grew = false;
+    for (const auto& column : effective) {
+      auto dep_it = dependencies.find(column);
+      if (dep_it == dependencies.end()) {
+        continue;
+      }
+      for (const auto& dependency : dep_it->second) {
+        if (effective.insert(dependency).second) {
+          grew = true;
+        }
+      }
+    }
+  }
+
+  return effective;
+}
+
+boost::optional<UsedColumns> resolveEffectiveUsedColumns(
+    const UsedColumns& requested,
+    const TableColumns& columns,
+    const ConstraintMap& constraints,
+    const ColumnDependencyMap& dependencies,
+    const std::map<std::string, size_t>& aliases) {
+  if (!FLAGS_enable_column_pruning) {
+    return boost::none;
+  }
+
+  UsedColumns effective;
+  for (const auto& column : requested) {
+    auto alias_it = aliases.find(column);
+    if (alias_it != aliases.end() &&
+        alias_it->second < columns.size()) {
+      effective.insert(std::get<0>(columns[alias_it->second]));
+    } else {
+      effective.insert(column);
+    }
+  }
+
+  // A constrained column must be materialized even if it is not selected,
+  // otherwise the SQL layer could not (re)evaluate the retained predicate.
+  for (const auto& entry : constraints) {
+    if (!entry.second.getAll().empty()) {
+      effective.insert(entry.first);
+    }
+  }
+
+  effective = expandColumnDependencies(effective, dependencies);
+
+  // Defensive: if expansion somehow reaches the full table width there is
+  // nothing to prune, and treating the scan as unpruned keeps helpers simple.
+  if (effective.size() >= columns.size()) {
+    return boost::none;
+  }
+
+  return effective;
 }
 
 } // namespace osquery

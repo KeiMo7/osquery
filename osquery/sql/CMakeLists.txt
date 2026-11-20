@@ -17,6 +17,7 @@ endfunction()
 function(generateOsquerySql)
   set(source_files
     dynamic_table_row.cpp
+    lazy_table_row.cpp
     sql.cpp
     sqlite_encoding.cpp
     sqlite_filesystem.cpp
@@ -60,6 +61,7 @@ function(generateOsquerySql)
   set(public_header_files
     sql.h
     dynamic_table_row.h
+    lazy_table_row.h
     sqlite_util.h
     virtual_table.h
   )

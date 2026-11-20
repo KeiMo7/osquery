@@ -13,6 +13,7 @@
 #include <osquery/core/core.h>
 #include <osquery/core/flagalias.h>
 #include <osquery/core/flags.h>
+#include <osquery/core/sql/column_dependencies.h>
 #include <osquery/core/system.h>
 #include <osquery/logger/logger.h>
 #include <osquery/process/process.h>
@@ -45,6 +46,8 @@ FLAG(bool,
      "true.");
 
 SHELL_FLAG(bool, planner, false, "Enable osquery runtime planner output");
+
+DECLARE_bool(enable_column_pruning);
 
 DECLARE_bool(disable_events);
 
@@ -362,6 +365,9 @@ int xNext(sqlite3_vtab_cursor* cur) {
     pCur->generator->operator()();
     if (*pCur->generator) {
       pCur->current = pCur->generator->get();
+      if (pCur->metrics) {
+        ++pCur->metrics->rows_generated;
+      }
     }
   }
   pCur->row++;
@@ -1007,8 +1013,66 @@ static int xFilter(sqlite3_vtab_cursor* pVtabCursor,
     // Unspecified; have to assume all columns are used
     context.colsUsedBitset->set();
   }
-  if (content->colsUsed.size() > 0) {
+  if (content->colsUsed.count(idxNum) > 0) {
     context.colsUsed = content->colsUsed[idxNum];
+  }
+
+  // Lazily fetch the table-declared column dependency/side effect groups.
+  // The interface stays unchanged: tables that do not override the hook keep
+  // an empty map and are treated as having independent columns.
+  if (!content->column_dependencies_initialized) {
+    content->column_dependencies =
+        ColumnDependencyRegistry::instance().get(content->name);
+    if (Registry::get().exists("table", content->name, true)) {
+      auto plugin = Registry::get().plugin("table", content->name);
+      auto table = std::dynamic_pointer_cast<TablePlugin>(plugin);
+      if (table != nullptr) {
+        for (const auto& entry : table->columnDependencies()) {
+          content->column_dependencies[entry.first] = entry.second;
+        }
+      }
+    }
+    content->column_dependencies_initialized = true;
+  }
+
+  // Build the effective used set: requested columns + constraint columns +
+  // dependency/side effect closure, gated by the pruning switch. An unset
+  // result means "all columns required", i.e. the historical behavior.
+  if (context.colsUsed) {
+    // A present (even empty) requested set means SQLite described the used
+    // columns; an empty one is a column-free query such as COUNT(*). A
+    // missing set means the plan could not describe the columns and the
+    // resolver stays conservative.
+    context.effectiveColsUsed = resolveEffectiveUsedColumns(
+        *context.colsUsed,
+        content->columns,
+        context.constraints,
+        content->column_dependencies,
+        content->aliases);
+  }
+
+  // Per-scan observability. The same structure is exposed to table code via
+  // QueryContext so implementations can count per-column work.
+  context.metrics = std::make_shared<TableQueryMetrics>();
+  context.metrics->scans = 1;
+  context.metrics->columns_requested =
+      context.colsUsed ? context.colsUsed->size() : content->columns.size();
+  context.metrics->columns_required = context.effectiveColsUsed
+                                         ? context.effectiveColsUsed->size()
+                                         : content->columns.size();
+  context.metrics->constraints_pushed =
+      content->constraints.count(idxNum) ? content->constraints[idxNum].size()
+                                         : 0U;
+
+  if (FLAGS_planner) {
+    plan("xFilter Column pruning for table: " + content->name +
+         " [requested=" +
+         std::to_string(context.metrics->columns_requested) +
+         " required=" +
+         std::to_string(context.metrics->columns_required) +
+         " total=" + std::to_string(content->columns.size()) +
+         " pushed_constraints=" +
+         std::to_string(context.metrics->constraints_pushed) + "]");
   }
 
   // Reset the virtual table contents.
@@ -1044,6 +1108,7 @@ static int xFilter(sqlite3_vtab_cursor* pVtabCursor,
 
   // Generate the row data set.
   plan("Scanning rows for cursor (" + std::to_string(pCur->id) + ")");
+  pCur->metrics = context.metrics;
   if (Registry::get().exists("table", pVtab->content->name, true)) {
     auto plugin = Registry::get().plugin("table", pVtab->content->name);
     auto table = std::dynamic_pointer_cast<TablePlugin>(plugin);
@@ -1086,6 +1151,9 @@ static int xFilter(sqlite3_vtab_cursor* pVtabCursor,
 
   // Set the number of rows.
   pCur->n = pCur->rows.size();
+  if (context.metrics) {
+    context.metrics->rows_generated = pCur->n;
+  }
 
   if (FLAGS_planner) {
     plan("xFilter " + pVtab->content->name +

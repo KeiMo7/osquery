@@ -383,6 +383,54 @@ using UsedColumnsBitset = std::bitset<
     std::numeric_limits<decltype(sqlite3_index_info().colUsed)>::digits>;
 
 /**
+ * @brief Declared column relationships for a table.
+ *
+ * The map associates a column with the additional columns that must be
+ * computed whenever the key column is requested. Two kinds of relationships
+ * use the same mechanism:
+ *
+ *  - Dependencies: column A is derived from data gathered while computing
+ *    column B (for example `on_disk` reuses the `path` readlink result).
+ *  - Side effect groups: columns share a single computation that mutates
+ *    cached state. Declaring the group symmetrically guarantees the whole
+    group runs whenever any member is requested, preserving the side effect
+ *    ordering and consistency of the unpruned implementation.
+ *
+ * The relation is closed transitively by the framework before a query runs.
+ */
+using ColumnDependencyMap =
+    std::unordered_map<std::string, std::vector<std::string>>;
+
+/**
+ * @brief Per-scan counters used to validate column pruning and pushdown.
+ *
+ * The counters are intentionally cheap to maintain and independent of wall
+ * clock measurements; they are populated by both the virtual table layer
+ * (scans, rows materialized) and by opt-in table implementations
+ * (columns actually computed).
+ */
+struct TableQueryMetrics {
+  /// Number of times the table implementation was entered for this query.
+  std::size_t scans{0};
+
+  /// Number of rows emitted by the table implementation.
+  std::size_t rows_generated{0};
+
+  /// Number of individual column computations performed.
+  std::size_t columns_computed{0};
+
+  /// Number of columns referenced by the SQL plan before expansion.
+  std::size_t columns_requested{0};
+
+  /// Number of columns that had to be computed after dependency/side effect
+  /// expansion. Equals the table width when pruning is disabled or unknown.
+  std::size_t columns_required{0};
+
+  /// Number of constraints accepted and handed to the table implementation.
+  std::size_t constraints_pushed{0};
+};
+
+/**
  * @brief osquery table content descriptor.
  *
  * This object is the abstracted SQLite database's virtual table descriptor.
@@ -424,6 +472,12 @@ struct VirtualTableContent {
 
   /// Transient set of virtual table used columns (as bitmasks)
   std::unordered_map<size_t, UsedColumnsBitset> colsUsedBitsets;
+
+  /// Column dependency/side effect groups declared by the table plugin.
+  ColumnDependencyMap column_dependencies;
+
+  /// True once the dependency map has been fetched from the plugin.
+  bool column_dependencies_initialized{false};
 
   /*
    * @brief A table implementation specific query result cache.
@@ -473,6 +527,9 @@ struct QueryContext {
   QueryContext(QueryContext&& other)
       : constraints(std::move(other.constraints)),
         colsUsed(std::move(other.colsUsed)),
+        colsUsedBitset(std::move(other.colsUsedBitset)),
+        effectiveColsUsed(std::move(other.effectiveColsUsed)),
+        metrics(std::move(other.metrics)),
         enable_cache_(other.enable_cache_),
         use_cache_(other.use_cache_),
         table_(other.table_) {
@@ -484,6 +541,9 @@ struct QueryContext {
   QueryContext& operator=(QueryContext&& other) {
     std::swap(constraints, other.constraints);
     std::swap(colsUsed, other.colsUsed);
+    std::swap(colsUsedBitset, other.colsUsedBitset);
+    std::swap(effectiveColsUsed, other.effectiveColsUsed);
+    std::swap(metrics, other.metrics);
     std::swap(enable_cache_, other.enable_cache_);
     std::swap(use_cache_, other.use_cache_);
     std::swap(table_, other.table_);
@@ -642,6 +702,39 @@ struct QueryContext {
   boost::optional<UsedColumns> colsUsed;
   boost::optional<UsedColumnsBitset> colsUsedBitset;
 
+  /**
+   * @brief Columns that must actually be computed for this scan.
+   *
+   * This is the requested set expanded with constraint columns, declared
+   * dependencies and side effect groups, then intersected with the pruning
+   * switch. When pruning is disabled, unsupported or unknown it is left
+   * unset, which makes every column-required helper report "all columns".
+   */
+  boost::optional<UsedColumns> effectiveColsUsed;
+
+  /// Per-scan observability counters, shared by all rows of the scan.
+  std::shared_ptr<TableQueryMetrics> metrics;
+
+  /**
+   * @brief Whether a column has to be computed for this scan.
+   *
+   * Unlike isColumnUsed(), this honors the effective (post-expansion) set
+   * and the pruning switch. Table implementations should use this helper to
+   * guard expensive column computations; the default-true result preserves
+   * the historical behavior for tables that do not opt in.
+   */
+  bool isColumnRequired(const std::string& colName) const;
+
+  /// True if at least one of the named columns has to be computed.
+  bool isAnyColumnRequired(
+      std::initializer_list<std::string> colNames) const;
+
+  /// Record that a single column value was computed by the implementation.
+  void recordColumnComputed() const;
+
+  /// Record that a row was emitted by the implementation.
+  void recordRowGenerated() const;
+
  private:
   /// If false then the context is maintaining an ephemeral cache.
   bool enable_cache_{false};
@@ -683,6 +776,22 @@ class TablePlugin : public Plugin {
   /// Return the table's column name and type pairs.
   virtual TableColumns columns() const {
     return TableColumns();
+  }
+
+  /**
+   * @brief Declare column computation dependencies and side effect groups.
+   *
+   * For every entry {column, dependencies} the framework guarantees that,
+   * whenever `column` is required by a pruned query, every dependency is
+   * computed as well. Symmetric entries form a side effect group whose
+   * members always run together, so skipping unrequested columns cannot
+   * break shared caches or other externally visible state updates.
+   *
+   * The default is an empty map: columns are assumed independent, which is
+   * the safe choice for tables that compute each column from scratch.
+   */
+  virtual ColumnDependencyMap columnDependencies() const {
+    return {};
   }
 
   /// Define a map of target columns to optional aliases.
@@ -923,6 +1032,32 @@ std::string columnDefinition(const TableColumns& columns,
 std::string columnDefinition(const PluginResponse& response,
                              bool aliases = false,
                              bool is_extension = false);
+
+/**
+ * @brief Expand a requested column set with dependency/side effect groups.
+ *
+ * The closure repeatedly adds every dependency of every included column until
+ * a fixed point is reached. Unknown column names in the dependency map are
+ * ignored rather than treated as errors, because the map is table-declared
+ * metadata and a stale entry must not break a scan.
+ */
+UsedColumns expandColumnDependencies(const UsedColumns& requested,
+                                     const ColumnDependencyMap& dependencies);
+
+/**
+ * @brief Resolve the effective used columns for a scan.
+ *
+ * Applies the pruning switch, constraint columns, alias resolution and
+ * dependency/side effect expansion. Returns an unset optional when pruning
+ * must not be applied (flag off, star select, missing information), which
+ * callers interpret as "every column is required".
+ */
+boost::optional<UsedColumns> resolveEffectiveUsedColumns(
+    const UsedColumns& requested,
+    const TableColumns& columns,
+    const ConstraintMap& constraints,
+    const ColumnDependencyMap& dependencies,
+    const std::map<std::string, size_t>& aliases);
 
 /// Get the string representation for an SQLite column type.
 inline const std::string& columnTypeName(ColumnType type) {
