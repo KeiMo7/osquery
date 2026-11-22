@@ -12,6 +12,8 @@
 #include <bitset>
 #include <map>
 #include <set>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -425,6 +427,20 @@ struct VirtualTableContent {
   /// Transient set of virtual table used columns (as bitmasks)
   std::unordered_map<size_t, UsedColumnsBitset> colsUsedBitsets;
 
+  /**
+   * @brief Watermarks delimiting the column requirements of one statement.
+   *
+   * Constraint and used-column sets are keyed by a globally increasing
+   * index and may outlive the statement that recorded them (the planning
+   * state is only cleared lazily). xBestIndex and xFilter use these
+   * watermarks to tell the entries of the statement currently being
+   * planned/executed apart from leftovers of previous statements:
+   * SQLite plans every cursor of a statement before generating any rows,
+   * so a filter call after a planning round marks its end.
+   */
+  size_t planning_start_idx{0};
+  bool filter_ran_{false};
+
   /*
    * @brief A table implementation specific query result cache.
    *
@@ -655,6 +671,31 @@ struct QueryContext {
  private:
   friend class TablePlugin;
 };
+
+/**
+ * @brief Run a column computation, annotating any failure with the column.
+ *
+ * Tables that compute columns on demand (see QueryContext::isColumnUsed)
+ * should wrap each computation, or each group of computations sharing a
+ * data source, with this helper. If the computation throws, the exception
+ * is rethrown with the column name attached, so an error surfacing through
+ * the virtual table layer identifies the column that failed instead of an
+ * opaque whole-table failure.
+ *
+ * @param column_name Name of the column (or column group) being computed.
+ * @param compute The computation to run.
+ * @return Whatever the computation returns.
+ */
+template <typename F>
+inline auto computeColumnValue(const std::string& column_name, F&& compute)
+    -> decltype(compute()) {
+  try {
+    return compute();
+  } catch (const std::exception& e) {
+    throw std::runtime_error("failed to compute column '" + column_name +
+                             "': " + e.what());
+  }
+}
 
 /**
  * @brief The TablePlugin defines the name, types, and column information.

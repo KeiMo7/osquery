@@ -33,6 +33,7 @@ function(generateOsqueryTablesSystemTestsMergedtestsTest)
   if(DEFINED PLATFORM_LINUX)
     list(APPEND source_files
       linux/apt_sources_tests.cpp
+      linux/column_pruning_tests.cpp
       linux/extended_attributes_tests.cpp
       linux/flatpak_packages_tests.cpp
       linux/md_tables_tests.cpp
@@ -96,7 +97,9 @@ function(generateOsqueryTablesSystemTestsMergedtestsTest)
     osquery_hashing
     osquery_registry
     osquery_sql
+    osquery_tables_networking
     osquery_tables_system_systemtable
+    osquery_tables_utility_utilitytable
     osquery_utils
     osquery_utils_conversions
     tests_helper

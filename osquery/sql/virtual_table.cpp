@@ -46,6 +46,13 @@ FLAG(bool,
 
 SHELL_FLAG(bool, planner, false, "Enable osquery runtime planner output");
 
+FLAG(bool,
+     enable_column_pruning,
+     true,
+     "Only compute columns used by the query. When disabled, every column "
+     "is computed, matching the behavior of tables that do not declare "
+     "column dependencies");
+
 DECLARE_bool(disable_events);
 
 RecursiveMutex kAttachMutex;
@@ -855,6 +862,13 @@ static int xBestIndex(sqlite3_vtab* tab, sqlite3_index_info* pIdxInfo) {
   }
 
   pIdxInfo->idxNum = static_cast<int>(kConstraintIndexID++);
+  // An xFilter ran since the previous planning round, so this xBestIndex
+  // starts the planning of a new statement. Constraint and used-column
+  // entries older than this watermark belong to previous statements.
+  if (pVtab->content->filter_ran_) {
+    pVtab->content->planning_start_idx = pIdxInfo->idxNum;
+    pVtab->content->filter_ran_ = false;
+  }
   if (FLAGS_planner) {
     plan("xBestIndex Recording constraint set for table: " +
          pVtab->content->name + " [cost=" + std::to_string(cost) +
@@ -1001,14 +1015,45 @@ static int xFilter(sqlite3_vtab_cursor* pVtabCursor,
     }
   }
 
-  if (!content->colsUsedBitsets.empty()) {
-    context.colsUsedBitset = content->colsUsedBitsets[idxNum];
+  if (FLAGS_enable_column_pruning) {
+    // SQLite plans the entire statement (xBestIndex for every cursor)
+    // before any row is generated, so the entries recorded since
+    // planning_start_idx hold the column requirements of every cursor over
+    // this table in this statement. Merge them: a subquery and its outer
+    // query (or a self-join) scan the same table through different cursors,
+    // and rows shared via the query cache must satisfy the union of all
+    // cursors. Entries from previous statements are excluded via the
+    // watermark. Different tables own separate VirtualTableContent, so
+    // joins still get per-table column requirements.
+    content->filter_ran_ = true;
+    if (!content->colsUsedBitsets.empty()) {
+      UsedColumnsBitset merged_bitset;
+      for (const auto& bitset_entry : content->colsUsedBitsets) {
+        if (bitset_entry.first >= content->planning_start_idx) {
+          merged_bitset |= bitset_entry.second;
+        }
+      }
+      context.colsUsedBitset = merged_bitset;
+    }
+    // Without recorded column usage, both optionals stay unset, which the
+    // QueryContext helpers treat as "every column is used".
+
+    if (!content->colsUsed.empty()) {
+      UsedColumns merged_columns;
+      for (const auto& used_entry : content->colsUsed) {
+        if (used_entry.first >= content->planning_start_idx) {
+          merged_columns.insert(used_entry.second.begin(),
+                                used_entry.second.end());
+        }
+      }
+      context.colsUsed = std::move(merged_columns);
+    }
   } else {
-    // Unspecified; have to assume all columns are used
-    context.colsUsedBitset->set();
-  }
-  if (content->colsUsed.size() > 0) {
-    context.colsUsed = content->colsUsed[idxNum];
+    // Column pruning is disabled: context.colsUsed and
+    // context.colsUsedBitset are left unset, which
+    // QueryContext::isColumnUsed(), isAnyColumnUsed() and
+    // defaultColumnsUsed() all treat as "every column is used". Table
+    // implementations therefore compute all columns (pre-pruning behavior).
   }
 
   // Reset the virtual table contents.

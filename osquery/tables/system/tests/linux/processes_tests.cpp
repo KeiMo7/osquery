@@ -11,7 +11,11 @@
 #include <vector>
 
 #include <gtest/gtest.h>
+#include <osquery/core/tables.h>
+#include <osquery/sql/dynamic_table_row.h>
 #include <osquery/tables/system/linux/processes.h>
+
+#include <unistd.h>
 
 namespace osquery {
 namespace tables {
@@ -120,6 +124,118 @@ TEST_F(ProcEnvironTest, no_trailing_nul) {
   auto got = parseProcessEnvironment(std::string(64, 'A'));
   ASSERT_EQ(1u, got.size());
   EXPECT_EQ(std::string(64, 'A'), got[0].first);
+}
+
+// Defined in linux/processes.cpp.
+TableRows genProcesses(QueryContext& context);
+
+class ProcessesColumnPruningTest : public ::testing::Test {
+ protected:
+  static std::string selfPid() {
+    return std::to_string(getpid());
+  }
+
+  // A context constrained to this process, with the given used columns.
+  static QueryContext prunedContext(
+      std::initializer_list<std::string> columns) {
+    QueryContext context;
+    context.constraints["pid"].add(Constraint(EQUALS, selfPid()));
+    context.colsUsed = UsedColumns(columns);
+    return context;
+  }
+
+  // A context constrained to this process, computing every column.
+  static QueryContext unprunedContext() {
+    QueryContext context;
+    context.constraints["pid"].add(Constraint(EQUALS, selfPid()));
+    return context;
+  }
+
+  static Row generateOne(QueryContext context) {
+    auto rows = genProcesses(context);
+    EXPECT_EQ(rows.size(), 1U);
+    return rows.empty() ? Row() : static_cast<Row>(*rows[0]);
+  }
+};
+
+TEST_F(ProcessesColumnPruningTest, unrequested_columns_are_not_computed) {
+  auto row = generateOne(prunedContext({"pid", "name"}));
+
+  EXPECT_EQ(row.at("pid"), selfPid());
+  EXPECT_FALSE(row.at("name").empty());
+
+  // Columns that each require reading extra /proc entries must be absent.
+  for (const auto& column :
+       {"cmdline", "path", "on_disk", "cwd", "root", "label", "cgroup_path",
+        "disk_bytes_read", "disk_bytes_written"}) {
+    EXPECT_EQ(row.count(column), 0U) << "column " << column << " was computed";
+  }
+}
+
+TEST_F(ProcessesColumnPruningTest, unpruned_context_computes_everything) {
+  auto row = generateOne(unprunedContext());
+
+  for (const auto& column :
+       {"cmdline", "path", "on_disk", "cwd", "root", "label",
+        "disk_bytes_read", "disk_bytes_written"}) {
+    EXPECT_EQ(row.count(column), 1U) << "column " << column << " is missing";
+  }
+}
+
+TEST_F(ProcessesColumnPruningTest, pruned_values_match_unpruned) {
+  const std::initializer_list<std::string> requested = {
+      "pid",   "name",  "path",   "cmdline", "cwd",   "root", "uid",
+      "gid",   "euid",  "egid",   "parent",  "state", "nice", "threads",
+      "on_disk", "start_time", "label"};
+
+  auto pruned = generateOne(prunedContext(requested));
+  auto unpruned = generateOne(unprunedContext());
+
+  for (const auto& column : requested) {
+    ASSERT_EQ(pruned.count(column), 1U) << column;
+    ASSERT_EQ(unpruned.count(column), 1U) << column;
+    EXPECT_EQ(pruned.at(column), unpruned.at(column)) << "column " << column;
+  }
+}
+
+TEST_F(ProcessesColumnPruningTest, empty_column_set_keeps_row_count) {
+  // count(*) semantics: no column is used, but the row must still exist.
+  auto pruned = prunedContext({});
+  auto rows = genProcesses(pruned);
+  EXPECT_EQ(rows.size(), 1U);
+
+  auto unpruned = unprunedContext();
+  auto unpruned_rows = genProcesses(unpruned);
+  EXPECT_EQ(rows.size(), unpruned_rows.size());
+}
+
+TEST_F(ProcessesColumnPruningTest, path_on_disk_dependency_group) {
+  auto unpruned = generateOne(unprunedContext());
+
+  // Requesting only path must still run the on_disk computation, which can
+  // strip a " (deleted)" suffix from path.
+  auto path_only = generateOne(prunedContext({"path"}));
+  EXPECT_EQ(path_only.count("on_disk"), 0U);
+  EXPECT_EQ(path_only.at("path"), unpruned.at("path"));
+
+  // Requesting only on_disk must compute (but not emit) path.
+  auto on_disk_only = generateOne(prunedContext({"on_disk"}));
+  EXPECT_EQ(on_disk_only.count("path"), 0U);
+  EXPECT_EQ(on_disk_only.at("on_disk"), unpruned.at("on_disk"));
+}
+
+TEST_F(ProcessesColumnPruningTest, column_error_identifies_column) {
+  try {
+    computeColumnValue("cmdline", []() -> std::string {
+      throw std::runtime_error("boom");
+    });
+    FAIL() << "expected an exception";
+  } catch (const std::exception& e) {
+    EXPECT_NE(std::string(e.what()).find("cmdline"), std::string::npos)
+        << e.what();
+    EXPECT_NE(std::string(e.what()).find("boom"), std::string::npos)
+        << e.what();
+  }
 }
 
 } // namespace tables

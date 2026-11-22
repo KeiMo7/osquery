@@ -373,6 +373,7 @@ QueryData genFileWindows(QueryContext& context, Logger& logger) {
 void genFileInfoPosix(const fs::path& path,
                       const fs::path& parent,
                       const std::string& pattern,
+                      const QueryContext& context,
                       QueryData& results) {
   // Must provide the path, filename, directory separate from boost path->string
   // helpers to match any explicit (query-parsed) predicate constraints.
@@ -384,7 +385,9 @@ void genFileInfoPosix(const fs::path& path,
 
   struct stat file_stat;
 
-  // On POSIX systems, first check the link state.
+  // On POSIX systems, first check the link state. The lstat also decides
+  // whether the row exists at all, so it is never skipped, even when column
+  // pruning is active.
   struct stat link_stat;
   if (lstat(path.string().c_str(), &link_stat) < 0) {
     // Path was not real, had too may links, or could not be accessed.
@@ -392,55 +395,77 @@ void genFileInfoPosix(const fs::path& path,
   }
   if (S_ISLNK(link_stat.st_mode)) {
     r["symlink"] = "1";
-    fs::path symlink_target = fs::read_symlink(path);
-    r["symlink_target_path"] = symlink_target.string();
+    if (context.isColumnUsed("symlink_target_path")) {
+      fs::path symlink_target = fs::read_symlink(path);
+      r["symlink_target_path"] = symlink_target.string();
+    }
   }
 
-  if (stat(path.string().c_str(), &file_stat)) {
-    file_stat = link_stat;
-  }
+  // Every remaining column is derived from stat(2) of the target, plus a
+  // status query for the file type. Skip those syscalls when the query uses
+  // none of these columns.
+  if (context.isAnyColumnUsed({"inode",
+                               "uid",
+                               "gid",
+                               "mode",
+                               "device",
+                               "size",
+                               "block_size",
+                               "hard_links",
+                               "atime",
+                               "mtime",
+                               "ctime",
+                               "btime",
+                               "type",
+                               "pid_with_namespace",
+                               "bsd_flags"})) {
+    if (stat(path.string().c_str(), &file_stat)) {
+      file_stat = link_stat;
+    }
 
-  r["inode"] = BIGINT(file_stat.st_ino);
-  r["uid"] = BIGINT(file_stat.st_uid);
-  r["gid"] = BIGINT(file_stat.st_gid);
-  r["mode"] = lsperms(file_stat.st_mode);
-  r["device"] = BIGINT(file_stat.st_rdev);
-  r["size"] = BIGINT(file_stat.st_size);
-  r["block_size"] = INTEGER(file_stat.st_blksize);
-  r["hard_links"] = INTEGER(file_stat.st_nlink);
+    r["inode"] = BIGINT(file_stat.st_ino);
+    r["uid"] = BIGINT(file_stat.st_uid);
+    r["gid"] = BIGINT(file_stat.st_gid);
+    r["mode"] = lsperms(file_stat.st_mode);
+    r["device"] = BIGINT(file_stat.st_rdev);
+    r["size"] = BIGINT(file_stat.st_size);
+    r["block_size"] = INTEGER(file_stat.st_blksize);
+    r["hard_links"] = INTEGER(file_stat.st_nlink);
 
-  r["atime"] = BIGINT(file_stat.st_atime);
-  r["mtime"] = BIGINT(file_stat.st_mtime);
-  r["ctime"] = BIGINT(file_stat.st_ctime);
+    r["atime"] = BIGINT(file_stat.st_atime);
+    r["mtime"] = BIGINT(file_stat.st_mtime);
+    r["ctime"] = BIGINT(file_stat.st_ctime);
 
 #if defined(__linux__)
-  // No 'birth' or create time in Linux or Windows.
-  r["btime"] = "0";
-  r["pid_with_namespace"] = "0";
+    // No 'birth' or create time in Linux or Windows.
+    r["btime"] = "0";
+    r["pid_with_namespace"] = "0";
 #else
-  r["btime"] = BIGINT(file_stat.st_birthtimespec.tv_sec);
+    r["btime"] = BIGINT(file_stat.st_birthtimespec.tv_sec);
 #endif
 
-  // Type booleans. A path whose status cannot be read gets the type "error",
-  // or "unknown" if it no longer exists.
-  boost::system::error_code ec;
-  auto status = fs::status(path, ec);
-  if (kTypeNames.count(status.type())) {
-    r["type"] = kTypeNames.at(status.type());
-  } else {
-    r["type"] = "unknown";
-  }
+    // Type booleans. A path whose status cannot be read gets the type "error",
+    // or "unknown" if it no longer exists.
+    boost::system::error_code ec;
+    auto status = fs::status(path, ec);
+    if (kTypeNames.count(status.type())) {
+      r["type"] = kTypeNames.at(status.type());
+    } else {
+      r["type"] = "unknown";
+    }
 
 #if defined(__APPLE__)
-  std::string bsd_file_flags_description;
-  if (!describeBSDFileFlags(bsd_file_flags_description, file_stat.st_flags)) {
-    VLOG(1)
-        << "The following file had undocumented BSD file flags (chflags) set: "
-        << path;
-  }
+    std::string bsd_file_flags_description;
+    if (!describeBSDFileFlags(bsd_file_flags_description,
+                              file_stat.st_flags)) {
+      VLOG(1)
+          << "The following file had undocumented BSD file flags (chflags) set: "
+          << path;
+    }
 
-  r["bsd_flags"] = bsd_file_flags_description;
+    r["bsd_flags"] = bsd_file_flags_description;
 #endif
+  }
 
   results.push_back(r);
 }
@@ -454,7 +479,7 @@ QueryData genFilePosix(QueryContext& context, Logger& logger) {
   // Iterate through each of the resolved/supplied paths.
   for (const auto& path_string : paths) {
     fs::path path = path_string;
-    genFileInfoPosix(path, path.parent_path(), "", results);
+    genFileInfoPosix(path, path.parent_path(), "", context, results);
   }
 
   // Resolve directories for EQUALS and LIKE operations.
@@ -470,7 +495,7 @@ QueryData genFilePosix(QueryContext& context, Logger& logger) {
       // Iterate over the directory and generate info for each regular file.
       fs::directory_iterator begin(directory_string), end;
       for (; begin != end; ++begin) {
-        genFileInfoPosix(begin->path(), directory_string, "", results);
+        genFileInfoPosix(begin->path(), directory_string, "", context, results);
       }
     } catch (const fs::filesystem_error& /* e */) {
       continue;

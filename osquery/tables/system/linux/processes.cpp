@@ -494,10 +494,11 @@ void genProcess(const std::string& pid,
                 std::uint64_t system_boot_time,
                 QueryContext& context,
                 TableRows& results) {
-  // Parse the process stat and status.
+  // The process stat and status are always parsed: most columns derive from
+  // them, and a process is only reported when both can be read. Skipping
+  // them under column pruning would change which rows exist, not just which
+  // columns are computed.
   SimpleProcStat proc_stat(pid);
-  // Parse the process io
-  SimpleProcIo proc_io(pid);
 
   if (!proc_stat.status.ok()) {
     VLOG(1) << proc_stat.status.getMessage() << " for pid " << pid;
@@ -507,28 +508,17 @@ void genProcess(const std::string& pid,
   auto r = make_table_row();
   r["pid"] = pid;
   r["parent"] = proc_stat.parent;
-  r["path"] = readProcLink("exe", pid);
   r["name"] = proc_stat.name;
   r["pgroup"] = proc_stat.group;
   r["state"] = proc_stat.state;
   r["nice"] = proc_stat.nice;
   r["threads"] = proc_stat.threads;
-  // Read/parse cmdline arguments.
-  r["cmdline"] = readProcCMDLine(pid);
-  if (context.isColumnUsed("cgroup_path")) {
-    r["cgroup_path"] = readProcCgroup(pid);
-  }
-  r["cwd"] = readProcLink("cwd", pid);
-  r["root"] = readProcLink("root", pid);
   r["uid"] = proc_stat.real_uid;
   r["euid"] = proc_stat.effective_uid;
   r["suid"] = proc_stat.saved_uid;
   r["gid"] = proc_stat.real_gid;
   r["egid"] = proc_stat.effective_gid;
   r["sgid"] = proc_stat.saved_gid;
-  r["label"] = readSecurityLabel(pid);
-
-  r["on_disk"] = INTEGER(getOnDisk(pid, r["path"]));
 
   // size/memory information
   r["wired_size"] = "0"; // No support for unpagable counters in linux.
@@ -550,17 +540,71 @@ void genProcess(const std::string& pid,
     r["start_time"] = "-1";
   }
 
-  if (!proc_io.status.ok()) {
-    // /proc/<pid>/io can require root to access, so don't fail if we can't
-    VLOG(1) << proc_io.status.getMessage();
-  } else {
-    r["disk_bytes_read"] = proc_io.read_bytes;
-    long long write_bytes = tryTo<long long>(proc_io.write_bytes).takeOr(0ll);
-    long long cancelled_write_bytes =
-        tryTo<long long>(proc_io.cancelled_write_bytes).takeOr(0ll);
+  // Each of the remaining columns requires reading additional /proc entries,
+  // so they are only computed when the query actually uses them.
 
-    r["disk_bytes_written"] =
-        std::to_string(write_bytes - cancelled_write_bytes);
+  // Read/parse cmdline arguments.
+  if (context.isColumnUsed("cmdline")) {
+    r["cmdline"] = computeColumnValue(
+        "cmdline", [&pid]() { return readProcCMDLine(pid); });
+  }
+
+  if (context.isColumnUsed("cgroup_path")) {
+    r["cgroup_path"] = computeColumnValue(
+        "cgroup_path", [&pid]() { return readProcCgroup(pid); });
+  }
+
+  if (context.isColumnUsed("cwd")) {
+    r["cwd"] = computeColumnValue(
+        "cwd", [&pid]() { return readProcLink("cwd", pid); });
+  }
+
+  if (context.isColumnUsed("root")) {
+    r["root"] = computeColumnValue(
+        "root", [&pid]() { return readProcLink("root", pid); });
+  }
+
+  if (context.isColumnUsed("label")) {
+    r["label"] = computeColumnValue(
+        "label", [&pid]() { return readSecurityLabel(pid); });
+  }
+
+  // path and on_disk form a dependency group: determining on_disk may
+  // rewrite path (a " (deleted)" suffix is stripped from it), so the
+  // computation must run whenever either of the two columns is used.
+  // Otherwise the value of path would depend on whether on_disk was also
+  // requested.
+  if (context.isAnyColumnUsed({"path", "on_disk"})) {
+    std::string path;
+    int on_disk = -1;
+    computeColumnValue("path, on_disk", [&pid, &path, &on_disk]() {
+      path = readProcLink("exe", pid);
+      on_disk = getOnDisk(pid, path);
+    });
+    if (context.isColumnUsed("path")) {
+      r["path"] = path;
+    }
+    if (context.isColumnUsed("on_disk")) {
+      r["on_disk"] = INTEGER(on_disk);
+    }
+  }
+
+  if (context.isAnyColumnUsed({"disk_bytes_read", "disk_bytes_written"})) {
+    // Parse the process io
+    SimpleProcIo proc_io(pid);
+
+    if (!proc_io.status.ok()) {
+      // /proc/<pid>/io can require root to access, so don't fail if we can't
+      VLOG(1) << proc_io.status.getMessage();
+    } else {
+      r["disk_bytes_read"] = proc_io.read_bytes;
+      long long write_bytes = tryTo<long long>(proc_io.write_bytes).takeOr(0ll);
+      long long cancelled_write_bytes =
+          tryTo<long long>(proc_io.cancelled_write_bytes).takeOr(0ll);
+
+      r["disk_bytes_written"] =
+          std::to_string(write_bytes - cancelled_write_bytes);
+    }
   }
 
   results.push_back(r);

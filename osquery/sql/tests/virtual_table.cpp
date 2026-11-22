@@ -22,6 +22,7 @@
 namespace osquery {
 
 DECLARE_bool(ignore_table_exceptions);
+DECLARE_bool(enable_column_pruning);
 
 class VirtualTableTests : public testing::Test {
  public:
@@ -1419,6 +1420,247 @@ TEST_F(VirtualTableTests, test_table_doc_hint) {
   auto hint = tables::sqlite::getTableDocHint("doc_hint_extension_table");
   EXPECT_EQ(hint.find("osquery.io"), std::string::npos) << hint;
   EXPECT_NE(hint.find("provided by an extension"), std::string::npos) << hint;
+}
+
+} // namespace osquery
+
+namespace osquery {
+
+// A table plugin recording the column requirements it receives, so tests can
+// observe what the virtual table layer propagates to table implementations.
+class columnPruningTablePlugin : public TablePlugin {
+ public:
+  explicit columnPruningTablePlugin(std::vector<std::string> column_names)
+      : column_names_(std::move(column_names)) {}
+
+  TableColumns columns() const override {
+    TableColumns columns;
+    for (const auto& name : column_names_) {
+      columns.push_back(std::make_tuple(name, TEXT_TYPE, options_));
+    }
+    return columns;
+  }
+
+  TableRows generate(QueryContext& context) override {
+    generates_++;
+    seen_cols_used_.push_back(context.colsUsed
+                                  ? boost::optional<UsedColumns>(
+                                        *context.colsUsed)
+                                  : boost::none);
+
+    auto r = make_table_row();
+    for (const auto& name : column_names_) {
+      r[name] = value_.empty() ? name + "1" : value_;
+    }
+    TableRows results;
+    results.push_back(std::move(r));
+    return results;
+  }
+
+  void setOptions(ColumnOptions options) {
+    options_ = options;
+  }
+
+  // Give every column the same value, so joins between two instances match.
+  void setValue(std::string value) {
+    value_ = std::move(value);
+  }
+
+  size_t generates_{0};
+  std::vector<boost::optional<UsedColumns>> seen_cols_used_;
+
+ private:
+  std::vector<std::string> column_names_;
+  ColumnOptions options_{ColumnOptions::DEFAULT};
+  std::string value_;
+};
+
+class ColumnPruningTests : public testing::Test {
+ public:
+  void SetUp() override {
+    platformSetup();
+    registryAndPluginInit();
+    initDatabasePluginForTesting();
+    FLAGS_enable_column_pruning = true;
+  }
+
+  void TearDown() override {
+    FLAGS_enable_column_pruning = true;
+  }
+
+  std::shared_ptr<columnPruningTablePlugin> attach(
+      const std::string& name,
+      std::vector<std::string> columns,
+      const SQLiteDBInstanceRef& dbc) {
+    auto plugin =
+        std::make_shared<columnPruningTablePlugin>(std::move(columns));
+    RegistryFactory::get().registry("table")->add(name, plugin);
+    attachTableInternal(name, dbc, false);
+    return plugin;
+  }
+};
+
+TEST_F(ColumnPruningTests, disabled_reports_all_columns) {
+  FLAGS_enable_column_pruning = false;
+  auto dbc = SQLiteDBManager::getUnique();
+  auto table = attach("prune_disabled", {"a", "b", "c"}, dbc);
+
+  QueryData results;
+  auto status = queryInternal("SELECT a FROM prune_disabled", results, dbc);
+  ASSERT_TRUE(status.ok()) << status.getMessage();
+  ASSERT_EQ(results, QueryData({{{"a", "a1"}}}));
+
+  // With pruning disabled the table cannot tell which columns the query
+  // used, so it computes all of them.
+  ASSERT_EQ(table->seen_cols_used_.size(), 1U);
+  EXPECT_FALSE(table->seen_cols_used_[0].is_initialized());
+}
+
+TEST_F(ColumnPruningTests, enabled_passes_only_used_columns) {
+  auto dbc = SQLiteDBManager::getUnique();
+  auto table = attach("prune_enabled", {"a", "b", "c"}, dbc);
+
+  QueryData results;
+  auto status = queryInternal("SELECT a FROM prune_enabled", results, dbc);
+  ASSERT_TRUE(status.ok()) << status.getMessage();
+  ASSERT_EQ(results, QueryData({{{"a", "a1"}}}));
+
+  ASSERT_EQ(table->seen_cols_used_.size(), 1U);
+  ASSERT_TRUE(table->seen_cols_used_[0].is_initialized());
+  EXPECT_EQ(*table->seen_cols_used_[0], UsedColumns({"a"}));
+}
+
+TEST_F(ColumnPruningTests, star_select_uses_all_columns) {
+  auto dbc = SQLiteDBManager::getUnique();
+  auto table = attach("prune_star", {"a", "b", "c"}, dbc);
+
+  QueryData results;
+  ASSERT_TRUE(queryInternal("SELECT * FROM prune_star", results, dbc).ok());
+  ASSERT_EQ(table->seen_cols_used_.size(), 1U);
+  ASSERT_TRUE(table->seen_cols_used_[0].is_initialized());
+  EXPECT_EQ(*table->seen_cols_used_[0], UsedColumns({"a", "b", "c"}));
+}
+
+TEST_F(ColumnPruningTests, where_columns_count_as_used) {
+  auto dbc = SQLiteDBManager::getUnique();
+  auto table = attach("prune_where", {"a", "b", "c"}, dbc);
+
+  // b is not an indexed column, so the constraint is not pushed down; the
+  // SQL layer must still apply it, and b must be reported as used so the
+  // table computes it for the filter to see.
+  QueryData results;
+  auto status =
+      queryInternal("SELECT a FROM prune_where WHERE b = 'b1'", results, dbc);
+  ASSERT_TRUE(status.ok()) << status.getMessage();
+  EXPECT_EQ(results, QueryData({{{"a", "a1"}}}));
+
+  ASSERT_EQ(table->seen_cols_used_.size(), 1U);
+  ASSERT_TRUE(table->seen_cols_used_[0].is_initialized());
+  EXPECT_EQ(*table->seen_cols_used_[0], UsedColumns({"a", "b"}));
+
+  // A non-matching filter still returns no rows.
+  results.clear();
+  status =
+      queryInternal("SELECT a FROM prune_where WHERE b = 'nope'", results, dbc);
+  ASSERT_TRUE(status.ok()) << status.getMessage();
+  EXPECT_TRUE(results.empty());
+}
+
+TEST_F(ColumnPruningTests, unpushed_constraints_still_filter) {
+  auto dbc = SQLiteDBManager::getUnique();
+  // i is INDEX, so constraints on it are pushed to xFilter; this plugin
+  // ignores them. SQLite must re-check the constraint itself.
+  auto table = attach("prune_indexed", {"i", "d"}, dbc);
+  table->setOptions(ColumnOptions::INDEX);
+
+  QueryData results;
+  auto status =
+      queryInternal("SELECT d FROM prune_indexed WHERE i = 'i1'", results, dbc);
+  ASSERT_TRUE(status.ok()) << status.getMessage();
+  EXPECT_EQ(results, QueryData({{{"d", "d1"}}}));
+
+  results.clear();
+  status = queryInternal(
+      "SELECT d FROM prune_indexed WHERE i = 'absent'", results, dbc);
+  ASSERT_TRUE(status.ok()) << status.getMessage();
+  EXPECT_TRUE(results.empty());
+}
+
+TEST_F(ColumnPruningTests, count_star_uses_no_columns) {
+  auto dbc = SQLiteDBManager::getUnique();
+  auto table = attach("prune_count", {"a", "b", "c"}, dbc);
+
+  QueryData results;
+  auto status =
+      queryInternal("SELECT count(*) AS n FROM prune_count", results, dbc);
+  ASSERT_TRUE(status.ok()) << status.getMessage();
+  ASSERT_EQ(results, QueryData({{{"n", "1"}}}));
+
+  // The column set is present but empty: no column needs computing.
+  ASSERT_EQ(table->seen_cols_used_.size(), 1U);
+  ASSERT_TRUE(table->seen_cols_used_[0].is_initialized());
+  EXPECT_TRUE(table->seen_cols_used_[0]->empty());
+}
+
+TEST_F(ColumnPruningTests, aggregates_use_only_aggregated_columns) {
+  auto dbc = SQLiteDBManager::getUnique();
+  auto table = attach("prune_aggregate", {"a", "b", "c"}, dbc);
+
+  QueryData results;
+  auto status = queryInternal(
+      "SELECT min(b) AS lo, max(b) AS hi FROM prune_aggregate", results, dbc);
+  ASSERT_TRUE(status.ok()) << status.getMessage();
+
+  ASSERT_EQ(table->seen_cols_used_.size(), 1U);
+  ASSERT_TRUE(table->seen_cols_used_[0].is_initialized());
+  EXPECT_EQ(*table->seen_cols_used_[0], UsedColumns({"b"}));
+}
+
+TEST_F(ColumnPruningTests, join_keeps_column_requirements_separate) {
+  auto dbc = SQLiteDBManager::getUnique();
+  auto left = attach("prune_join_left", {"a", "b", "c"}, dbc);
+  auto right = attach("prune_join_right", {"x", "y", "z"}, dbc);
+  left->setValue("1");
+  right->setValue("1");
+
+  QueryData results;
+  auto status = queryInternal(
+      "SELECT l.a, r.x FROM prune_join_left l JOIN prune_join_right r ON "
+      "l.b = r.y",
+      results,
+      dbc);
+  ASSERT_TRUE(status.ok()) << status.getMessage();
+  ASSERT_EQ(results.size(), 1U);
+
+  // Each table must receive its own column requirements, not the union.
+  ASSERT_EQ(left->seen_cols_used_.size(), 1U);
+  ASSERT_TRUE(left->seen_cols_used_[0].is_initialized());
+  EXPECT_EQ(*left->seen_cols_used_[0], UsedColumns({"a", "b"}));
+
+  ASSERT_EQ(right->seen_cols_used_.size(), 1U);
+  ASSERT_TRUE(right->seen_cols_used_[0].is_initialized());
+  EXPECT_EQ(*right->seen_cols_used_[0], UsedColumns({"x", "y"}));
+}
+
+TEST_F(ColumnPruningTests, subquery_merges_column_requirements) {
+  auto dbc = SQLiteDBManager::getUnique();
+  auto table = attach("prune_subquery", {"a", "b", "c"}, dbc);
+
+  QueryData results;
+  auto status = queryInternal(
+      "SELECT a FROM prune_subquery WHERE b IN (SELECT c FROM prune_subquery)",
+      results,
+      dbc);
+  ASSERT_TRUE(status.ok()) << status.getMessage();
+
+  // The table is scanned by two cursors (outer query and subquery). Both
+  // must see the merged column requirements, so rows shared between the
+  // scans are computed consistently.
+  ASSERT_EQ(table->seen_cols_used_.size(), 2U);
+  for (const auto& seen : table->seen_cols_used_) {
+    ASSERT_TRUE(seen.is_initialized());
+    EXPECT_EQ(*seen, UsedColumns({"a", "b", "c"}));
+  }
 }
 
 } // namespace osquery

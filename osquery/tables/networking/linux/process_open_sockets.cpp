@@ -41,6 +41,15 @@ QueryData genOpenSockets(QueryContext& context) {
     }
   }
 
+  /* Collecting the pid/fd for each socket (step 1 below) requires scanning
+   * /proc/<pid>/fd for every process, which is by far the most expensive
+   * part of this table. It is only needed when the query uses the pid/fd
+   * columns, or when a pid constraint requires the inode-to-process map to
+   * filter rows.
+   */
+  const bool process_columns_used = context.isAnyColumnUsed({"pid", "fd"});
+  const bool collect_process_info = pid_filter || process_columns_used;
+
   /* Data for this table is fetched from 3 different sources and correlated.
    *
    * 1. Collect all sockets associated with each pid by going through all files
@@ -71,11 +80,14 @@ QueryData genOpenSockets(QueryContext& context) {
   SocketInfoList socket_list;
   for (const auto& pid : pids) {
     /* Step 1 */
-    status = procGetSocketInodeToProcessInfoMap(pid, inode_proc_map);
-    if (!status.ok()) {
-      VLOG(1) << "Results for process_open_sockets might be incomplete. Failed "
-                 "to acquire socket inode to process map for pid "
-              << pid << ": " << status.what();
+    if (collect_process_info) {
+      status = procGetSocketInodeToProcessInfoMap(pid, inode_proc_map);
+      if (!status.ok()) {
+        VLOG(1) << "Results for process_open_sockets might be incomplete. "
+                   "Failed "
+                   "to acquire socket inode to process map for pid "
+                << pid << ": " << status.what();
+      }
     }
 
     /* Step 2 */
@@ -147,8 +159,10 @@ QueryData genOpenSockets(QueryContext& context) {
       r["pid"] = proc_it->second.pid;
       r["fd"] = proc_it->second.fd;
     } else if (!pid_filter) {
-      r["pid"] = "-1";
-      r["fd"] = "-1";
+      if (process_columns_used) {
+        r["pid"] = "-1";
+        r["fd"] = "-1";
+      }
     } else {
       /* If we're filtering by pid we only care about sockets associated with
        * pids on the list.*/
