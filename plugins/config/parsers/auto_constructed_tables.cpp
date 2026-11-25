@@ -18,12 +18,47 @@
 #include <osquery/registry/registry_factory.h>
 #include <osquery/sql/sql.h>
 #include <osquery/sql/sqlite_util.h>
+#include <osquery/sql/table_publication.h>
 #include <osquery/utils/conversions/join.h>
 #include <plugins/config/parsers/auto_constructed_tables.h>
+
+#include <map>
+#include <thread>
+#include <unordered_set>
 
 namespace rj = rapidjson;
 
 namespace osquery {
+
+namespace {
+
+struct ATCCandidate {
+  TableEntryPtr entry;
+  std::shared_ptr<ATCPlugin> plugin;
+  std::string settings;
+  std::string old_database_value;
+  bool had_database_value{false};
+  bool database_key_written{false};
+};
+
+struct AsyncATCCandidateReaper {
+  std::vector<ATCCandidate>* candidates;
+
+  explicit AsyncATCCandidateReaper(std::vector<ATCCandidate>* value)
+      : candidates(value) {}
+
+  ~AsyncATCCandidateReaper() {
+    if (candidates == nullptr || candidates->empty()) {
+      return;
+    }
+
+    std::thread([held = std::move(*candidates)]() mutable {
+      (void)held;
+    }).detach();
+  }
+};
+
+} // namespace
 
 TableAttributes ATCPlugin::attributes() const {
   return table_attributes_;
@@ -135,7 +170,15 @@ Status ATCConfigParserPlugin::update(const std::string& source,
   const auto& ac_tables = data_.doc()[kParserKey];
   auto tables = RegistryFactory::get().registry("table");
   auto registered = registeredATCTables();
+  auto previous_snapshot = TablePublicationRegistry::snapshot();
 
+  std::vector<ATCCandidate> candidates;
+  AsyncATCCandidateReaper candidate_reaper(&candidates);
+  std::set<std::string> configured_names;
+  std::string content_hash = source;
+
+  // Phase 1: parse every entry and perform all no-database validation. No
+  // table is published until the complete candidate vector is available.
   for (const auto& ac_table : ac_tables.GetObject()) {
     if (!ac_table.name.IsString() || !ac_table.value.IsObject()) {
       // This entry is not formatted correctly.
@@ -143,6 +186,8 @@ Status ATCConfigParserPlugin::update(const std::string& source,
     }
 
     std::string table_name{ac_table.name.GetString()};
+    configured_names.insert(table_name);
+    registered.erase(table_name);
     auto params = ac_table.value.GetObject();
 
     std::string query{params.HasMember("query") && params["query"].IsString()
@@ -171,6 +216,8 @@ Status ATCConfigParserPlugin::update(const std::string& source,
     TableColumns columns;
     std::string columns_value;
     columns_value.reserve(256);
+    bool duplicate_column = false;
+    std::unordered_set<std::string> seen_columns;
 
     if (!params.HasMember("columns") || !params["columns"].IsArray()) {
       LOG(WARNING) << "ATC Table: Skipping " << table_name
@@ -187,13 +234,26 @@ Status ATCConfigParserPlugin::update(const std::string& source,
         continue;
       }
 
-      if (boost::iequals(column.GetString(), "path")) {
-        user_defined_path_column = column.GetString();
+      std::string column_name{column.GetString()};
+      auto folded_name = boost::algorithm::to_lower_copy(column_name);
+      if (!seen_columns.insert(folded_name).second) {
+        duplicate_column = true;
+        LOG(WARNING) << "ATC Table: Skipping " << table_name
+                     << " because column " << column_name << " is duplicated";
+        break;
+      }
+
+      if (boost::iequals(column_name, "path")) {
+        user_defined_path_column = column_name;
       }
 
       columns.push_back(make_tuple(
           std::string(column.GetString()), TEXT_TYPE, ColumnOptions::DEFAULT));
       columns_value += std::string(column.GetString()) + ",";
+    }
+
+    if (duplicate_column) {
+      continue;
     }
 
     if (!user_defined_path_column.empty()) {
@@ -208,60 +268,159 @@ Status ATCConfigParserPlugin::update(const std::string& source,
       columns_value += "path,";
     }
 
-    registered.erase(table_name);
     std::string table_settings{table_name + query + columns_value + path};
+    content_hash += "|" + table_settings;
+
     std::string old_setting;
-    auto s = getDatabaseValue(
-        kPersistentSettings, kDatabaseKeyPrefix + table_name, old_setting);
+    bool had_database_value =
+        getDatabaseValue(
+            kPersistentSettings, kDatabaseKeyPrefix + table_name, old_setting)
+            .ok();
 
-    // The ATC table hasn't changed so we skip ahead
-    if (table_settings == old_setting) {
-      continue;
-    }
-
-    // Remove the old table to replace with the new one
-    s = removeATCTables({table_name});
-    if (!s.ok()) {
+    // A registry item without a corresponding atc.* key is a built-in/core or
+    // otherwise non-ATC table. Refuse to overwrite it.
+    if (tables->exists(table_name) && !had_database_value) {
       LOG(WARNING) << "ATC Table: " << table_name
                    << " overrides core table; Refusing registration";
       continue;
     }
 
-    s = setDatabaseValue(
-        kPersistentSettings, kDatabaseKeyPrefix + table_name, table_settings);
-    if (!s.ok()) {
-      LOG(WARNING) << "ATC Table: " << table_name
-                   << " could not write to database";
+    auto entry = std::make_shared<TableEntry>(
+        table_name, nullptr, columns, TableAttributes::PENDING, 0, source);
+    entry->query = query;
+    entry->sql = query;
+    entry->path = path;
+    entry->requires_sqlite_source = true;
+
+    std::string reason;
+    auto validation = TablePublicationRegistry::validate(*entry, reason);
+    if (!validation.ok()) {
+      LOG(WARNING) << "ATC Table: Skipping " << table_name << ": " << reason;
       continue;
     }
 
     auto plugin = std::make_shared<ATCPlugin>(path, columns, query);
-    s = tables->add(table_name, plugin, true);
-    if (!s.ok()) {
-      LOG(WARNING) << "ATC Table: " << table_name << ": " << s.getMessage();
+    entry->plugin = std::static_pointer_cast<TablePlugin>(plugin);
+    entry->attributes = plugin->attributes();
+    entry->after_attach_verification = [plugin]() { plugin->setActive(); };
+
+    ATCCandidate candidate;
+    candidate.entry = entry;
+    candidate.plugin = plugin;
+    candidate.settings = table_settings;
+    candidate.old_database_value = old_setting;
+    candidate.had_database_value = had_database_value;
+    candidates.push_back(std::move(candidate));
+  }
+
+  // Phase 2: persist atc.* keys. A failed key write excludes only that entry
+  // and removes the key it attempted to write.
+  std::vector<TableEntryPtr> desired;
+  desired.reserve(candidates.size());
+
+  for (auto& candidate : candidates) {
+    const auto& table_name = candidate.entry->name;
+    auto status = setDatabaseValue(kPersistentSettings,
+                                   kDatabaseKeyPrefix + table_name,
+                                   candidate.settings);
+    if (!status.ok()) {
+      LOG(WARNING) << "ATC Table: " << table_name
+                   << " could not write to database: " << status.getMessage();
       deleteDatabaseValue(kPersistentSettings, kDatabaseKeyPrefix + table_name);
       continue;
     }
 
-    PluginResponse resp;
-    s = Registry::call(
-        "sql", "sql", {{"action", "attach"}, {"table", table_name}}, resp);
-    if (!s.ok()) {
-      LOG(WARNING) << "ATC Table: " << table_name << ": " << s.getMessage();
-      deleteDatabaseValue(kPersistentSettings, kDatabaseKeyPrefix + table_name);
-    }
-    plugin->setActive();
-
-    LOG(INFO) << "ATC table: " << table_name << " Registered";
+    candidate.database_key_written = true;
+    desired.push_back(candidate.entry);
   }
 
-  if (registered.size() > 0) {
+  TablePublicationStats publication_stats;
+  std::vector<std::string> explicit_removals;
+  for (const auto& old_item : previous_snapshot->tables) {
+    const auto& old_entry = old_item.second;
+    if (old_entry && old_entry->source == source &&
+        configured_names.count(old_entry->name) == 0) {
+      explicit_removals.push_back(old_entry->name);
+    }
+  }
+
+  auto publish_status = TablePublicationRegistry::publish(
+      desired, explicit_removals, content_hash, publication_stats);
+
+  auto restore_database_keys = [&](const std::set<std::string>& names) {
+    for (auto& candidate : candidates) {
+      const auto& name = candidate.entry->name;
+      if (names.count(name) == 0 || !candidate.database_key_written) {
+        continue;
+      }
+
+      if (candidate.had_database_value) {
+        setDatabaseValue(kPersistentSettings,
+                         kDatabaseKeyPrefix + name,
+                         candidate.old_database_value);
+      } else {
+        deleteDatabaseValue(kPersistentSettings, kDatabaseKeyPrefix + name);
+      }
+    }
+  };
+
+  if (publish_status.getCode() != 0 && publish_status.getCode() != 2) {
+    LOG(INFO) << "ATC table publication failed: "
+              << publish_status.getMessage();
+    std::set<std::string> candidate_names;
+    for (const auto& candidate : candidates) {
+      candidate_names.insert(candidate.entry->name);
+    }
+    restore_database_keys(candidate_names);
+    return publish_status;
+  }
+
+  if (publish_status.getCode() == 0) {
+    // Restore keys for entries that were written locally but did not become
+    // effective publication entries because of a conflict/registry failure.
+    std::set<std::string> published_names(
+        publication_stats.published_tables.begin(),
+        publication_stats.published_tables.end());
+    std::set<std::string> unsuccessful_names;
+    for (const auto& candidate : candidates) {
+      const auto& name = candidate.entry->name;
+      if (published_names.count(name) == 0) {
+        unsuccessful_names.insert(name);
+      }
+    }
+    restore_database_keys(unsuccessful_names);
+
+    for (const auto& name : publication_stats.published_tables) {
+      for (auto& candidate : candidates) {
+        if (candidate.entry->name == name) {
+          candidate.plugin->setActive();
+          break;
+        }
+      }
+      LOG(INFO) << "ATC table: " << name << " Registered";
+    }
+  }
+
+  // Remove atc.* keys and registry ownership for tables absent from this
+  // source. Preserve tables owned by another configuration source.
+  std::set<std::string> keys_to_remove;
+  for (const auto& table_name : registered) {
+    auto old_entry = previous_snapshot->find(table_name);
+    if (old_entry && !old_entry->source.empty() &&
+        old_entry->source != source) {
+      continue;
+    }
+    keys_to_remove.insert(table_name);
+  }
+
+  if (!keys_to_remove.empty()) {
     VLOG(1)
         << "Removing any ATC tables that were removed in this configuration "
            "change";
-    removeATCTables(registered);
+    removeATCTables(keys_to_remove);
   }
-  return Status();
+
+  return Status::success();
 }
 
 REGISTER_INTERNAL(ATCConfigParserPlugin,

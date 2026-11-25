@@ -10,7 +10,10 @@
 #pragma once
 
 #include <bitset>
+#include <cstdint>
+#include <functional>
 #include <map>
+#include <memory>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -221,6 +224,9 @@ using AliasColumnMap = std::unordered_map<std::string, std::string>;
 
 /// Forward declaration of QueryContext for ConstraintList relationships.
 struct QueryContext;
+
+/// Immutable publication entry; its definition follows TablePlugin.
+struct TableEntry;
 
 /**
  * @brief A ConstraintList is a set of constraints for a column. This list
@@ -441,6 +447,10 @@ struct VirtualTableContent {
    * This caching does not affect or use the schedule results cache.
    */
   std::map<std::string, TableRowHolder> cache;
+
+  /// Publication generation entry that owns the plugin and column definition.
+  /// Null for tables attached exclusively through the legacy registry path.
+  std::shared_ptr<const TableEntry> entry;
 };
 
 using RowGenerator = boost::coroutines2::coroutine<TableRowHolder>;
@@ -913,6 +923,64 @@ class TablePlugin : public Plugin {
   FRIEND_TEST(VirtualTableTests, test_table_results_cache);
   FRIEND_TEST(VirtualTableTests, test_table_results_cache_colcheck);
   FRIEND_TEST(VirtualTableTests, test_yield_generator);
+};
+
+/**
+ * @brief One immutable generation-published table definition.
+ *
+ * Instances are replaced as a whole by TablePublicationRegistry snapshots.
+ * The plugin and columns are inputs to construction and must not be mutated by
+ * publication or query code afterwards. Shared ownership keeps both alive for
+ * as long as any SQLite VirtualTableContent references the entry.
+ */
+struct TableEntry {
+  TableEntry() = default;
+
+  TableEntry(std::string entry_name,
+             std::shared_ptr<TablePlugin> table_plugin,
+             TableColumns table_columns,
+             TableAttributes table_attributes,
+             uint64_t entry_generation,
+             std::string entry_source)
+      : name(std::move(entry_name)),
+        plugin(std::move(table_plugin)),
+        columns(std::move(table_columns)),
+        attributes(table_attributes),
+        generation(entry_generation),
+        source(std::move(entry_source)) {}
+
+  /// Table name exposed to SQLite and the table registry.
+  std::string name;
+
+  /// Shared plugin implementation. Never destroyed while a cursor may use it.
+  std::shared_ptr<TablePlugin> plugin;
+
+  /// Fixed column definition used by xCreate and the virtual table callbacks.
+  TableColumns columns;
+
+  /// Table attribute flags captured when the entry was published.
+  TableAttributes attributes{TableAttributes::NONE};
+
+  /// Publication generation that first introduced this entry.
+  uint64_t generation{0};
+
+  /// Configuration source or other publisher that owns this entry.
+  std::string source;
+
+  /// Optional SQLite SELECT/WITH text for ATC-style validation.
+  std::string query;
+
+  /// Alias used by callers that spell the SQL field ``sql`` rather than query.
+  std::string sql;
+
+  /// Optional SQLite database path used by ATC-style validation/generation.
+  std::string path;
+
+  /// When true, an empty query/path is treated as a validation failure.
+  bool requires_sqlite_source{false};
+
+  /// Optional hook invoked after attach verification and before atomic swap.
+  std::function<void()> after_attach_verification;
 };
 
 /// Helper method to generate the virtual table CREATE statement.

@@ -26,6 +26,7 @@ function(generateOsquerySql)
     sqlite_operations.cpp
     sqlite_util.cpp
     sqlite_version.cpp
+    table_publication.cpp
     virtual_sqlite_table.cpp
     virtual_table.cpp
   )
@@ -61,12 +62,14 @@ function(generateOsquerySql)
     sql.h
     dynamic_table_row.h
     sqlite_util.h
+    table_publication.h
     virtual_table.h
   )
 
   generateIncludeNamespace(osquery_sql "osquery/sql" "FILE_ONLY" ${public_header_files})
 
   add_test(NAME osquery_sql_tests-test COMMAND osquery_sql_tests-test)
+  add_test(NAME osquery_sql_tests_tablepublicationtests-test COMMAND osquery_sql_tests_tablepublicationtests-test)
   add_test(NAME osquery_sql_tests_virtualtabletests-test COMMAND osquery_sql_tests_virtualtabletests-test)
   add_test(NAME osquery_sql_tests_sqliteutilstests-test COMMAND osquery_sql_tests_sqliteutilstests-test)
   add_test(NAME osquery_sql_tests_sqlitehashingstests-test COMMAND osquery_sql_tests_sqlitehashingtests-test)

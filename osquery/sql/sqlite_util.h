@@ -10,7 +10,10 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
+#include <exception>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <unordered_set>
 
@@ -28,6 +31,8 @@
 #define SQLITE_SOFT_HEAP_LIMIT (5 * 1024 * 1024)
 
 namespace osquery {
+
+struct TableSnapshot;
 
 int sqliteAuthorizer(void* userData,
                      int code,
@@ -139,6 +144,28 @@ class SQLiteDBInstance : private boost::noncopyable {
   /// Lock the database for attaching virtual tables.
   RecursiveLock attachLock() const;
 
+  /// Publication snapshot used when this instance attached its tables.
+  void setPublicationSnapshot(std::shared_ptr<const TableSnapshot> snapshot);
+
+  std::shared_ptr<const TableSnapshot> publicationSnapshot() const;
+
+  /// Generation recorded from the snapshot used by this instance.
+  uint64_t snapshot_generation{0};
+
+  uint64_t snapshotGeneration() const {
+    return snapshot_generation;
+  }
+
+  uint64_t snapshot_generation_value() const {
+    return snapshot_generation;
+  }
+
+  /// Capture an exception caught at a SQLite C callback boundary.
+  void setPendingException(std::exception_ptr exception);
+
+  /// Move out a captured callback exception, if one is present.
+  std::exception_ptr takePendingException();
+
  private:
   /// Handle the primary/forwarding requests for table attribute accesses.
   TableAttributes getAttributes() const;
@@ -185,6 +212,12 @@ class SQLiteDBInstance : private boost::noncopyable {
   /// content since a table and its aliases share a name.
   std::map<const VirtualTableContent*, std::shared_ptr<VirtualTableContent>>
       affected_tables_;
+
+  /// Single publication generation bound to this connection.
+  std::shared_ptr<const TableSnapshot> publication_snapshot_;
+
+  /// Exception captured in an x* callback and rethrown after sqlite3_step.
+  std::exception_ptr pending_exception_;
 
  private:
   friend class SQLiteDBManager;

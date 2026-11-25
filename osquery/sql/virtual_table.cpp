@@ -312,23 +312,79 @@ static void plan(const std::string& output) {
 }
 
 int xOpen(sqlite3_vtab* tab, sqlite3_vtab_cursor** ppCursor) {
-  auto* pCur = new BaseCursor;
-  auto* pVtab = (VirtualTable*)tab;
-  if (FLAGS_planner) {
-    plan("xOpen Opening cursor (" + std::to_string(kPlannerCursorID) +
-         ") for table: " + pVtab->content->name);
-  }
-  pCur->id = kPlannerCursorID++;
-  pCur->base.pVtab = tab;
-  *ppCursor = (sqlite3_vtab_cursor*)pCur;
+  std::string table_name;
+  bool track_cursor = false;
+  bool cursor_counted = false;
+  BaseCursor* pCur = nullptr;
 
-  return SQLITE_OK;
+  try {
+    pCur = new BaseCursor;
+    auto* pVtab = (VirtualTable*)tab;
+    table_name = pVtab->content->name;
+    track_cursor = static_cast<bool>(pVtab->content->entry);
+
+    if (FLAGS_planner) {
+      plan("xOpen Opening cursor (" + std::to_string(kPlannerCursorID) +
+           ") for table: " + table_name);
+    }
+    pCur->id = kPlannerCursorID++;
+    pCur->base.pVtab = tab;
+    *ppCursor = (sqlite3_vtab_cursor*)pCur;
+
+    if (track_cursor) {
+      TablePublicationRegistry::acquireCursor(table_name);
+      cursor_counted = true;
+      pCur->publication_cursor_counted = true;
+    }
+    return SQLITE_OK;
+  } catch (const std::exception& e) {
+    VLOG(1) << "Exception while opening virtual table cursor"
+            << (table_name.empty() ? "" : " for " + table_name) << ": "
+            << e.what();
+    if (cursor_counted) {
+      TablePublicationRegistry::releaseCursor(table_name);
+      cursor_counted = false;
+      if (pCur != nullptr) {
+        pCur->publication_cursor_counted = false;
+      }
+    }
+    return SQLITE_ERROR;
+  } catch (...) {
+    VLOG(1) << "Unknown exception while opening virtual table cursor";
+    if (cursor_counted) {
+      TablePublicationRegistry::releaseCursor(table_name);
+      if (pCur != nullptr) {
+        pCur->publication_cursor_counted = false;
+      }
+    }
+    return SQLITE_ERROR;
+  }
 }
 
 int xClose(sqlite3_vtab_cursor* cur) {
-  BaseCursor* pCur = (BaseCursor*)cur;
-  plan("Closing cursor (" + std::to_string(pCur->id) + ")");
-  delete pCur;
+  try {
+    BaseCursor* pCur = (BaseCursor*)cur;
+    if (pCur != nullptr && pCur->publication_cursor_counted) {
+      std::string table_name;
+      if (cur != nullptr && cur->pVtab != nullptr) {
+        auto* pVtab = reinterpret_cast<VirtualTable*>(cur->pVtab);
+        if (pVtab->content) {
+          table_name = pVtab->content->name;
+        }
+      }
+
+      pCur->publication_cursor_counted = false;
+      TablePublicationRegistry::releaseCursor(table_name);
+    }
+
+    plan("Closing cursor (" + std::to_string(pCur->id) + ")");
+    delete pCur;
+  } catch (const std::exception& e) {
+    VLOG(1) << "Exception while closing virtual table cursor: " << e.what();
+  } catch (...) {
+    VLOG(1) << "Unknown exception while closing virtual table cursor";
+  }
+
   return SQLITE_OK;
 }
 
@@ -357,36 +413,52 @@ int xDestroy(sqlite3_vtab* p) {
 }
 
 int xNext(sqlite3_vtab_cursor* cur) {
-  BaseCursor* pCur = (BaseCursor*)cur;
-  if (pCur->uses_generator) {
-    pCur->generator->operator()();
-    if (*pCur->generator) {
-      pCur->current = pCur->generator->get();
+  try {
+    BaseCursor* pCur = (BaseCursor*)cur;
+    if (pCur->uses_generator) {
+      pCur->generator->operator()();
+      if (*pCur->generator) {
+        pCur->current = pCur->generator->get();
+      }
     }
+    pCur->row++;
+    return SQLITE_OK;
+  } catch (const std::exception& e) {
+    VLOG(1) << "Exception in xNext SQLite callback: " << e.what();
+    return SQLITE_ERROR;
+  } catch (...) {
+    VLOG(1) << "Unknown exception in xNext SQLite callback";
+    return SQLITE_ERROR;
   }
-  pCur->row++;
-  return SQLITE_OK;
 }
 
 int xRowid(sqlite3_vtab_cursor* cur, sqlite_int64* pRowid) {
-  *pRowid = 0;
+  try {
+    *pRowid = 0;
 
-  const BaseCursor* pCur = (BaseCursor*)cur;
-  auto data_it = std::next(pCur->rows.begin(), pCur->row);
-  if (data_it >= pCur->rows.end()) {
+    const BaseCursor* pCur = (BaseCursor*)cur;
+    auto data_it = std::next(pCur->rows.begin(), pCur->row);
+    if (data_it >= pCur->rows.end()) {
+      return SQLITE_ERROR;
+    }
+
+    // Use the rowid returned by the extension, if available; most likely, this
+    // will only be used by extensions providing read/write tables
+    const auto& current_row = *data_it;
+    return current_row->get_rowid(pCur->row, pRowid);
+  } catch (const std::exception& e) {
+    VLOG(1) << "Exception in xRowid SQLite callback: " << e.what();
+    return SQLITE_ERROR;
+  } catch (...) {
+    VLOG(1) << "Unknown exception in xRowid SQLite callback";
     return SQLITE_ERROR;
   }
-
-  // Use the rowid returned by the extension, if available; most likely, this
-  // will only be used by extensions providing read/write tables
-  const auto& current_row = *data_it;
-  return current_row->get_rowid(pCur->row, pRowid);
 }
 
-int xUpdate(sqlite3_vtab* p,
-            int argc,
-            sqlite3_value** argv,
-            sqlite3_int64* pRowid) {
+int xUpdateImpl(sqlite3_vtab* p,
+                int argc,
+                sqlite3_value** argv,
+                sqlite3_int64* pRowid) {
   auto argument_count = static_cast<size_t>(argc);
   auto* pVtab = (VirtualTable*)p;
 
@@ -483,9 +555,49 @@ int xUpdate(sqlite3_vtab* p,
 
   TablePlugin::setRequestFromContext(context, plugin_request);
 
-  // Forward the query to the table extension
+  // Forward the query to the table implementation. Publication entries call
+  // the shared plugin directly; all other tables retain the registry path.
   PluginResponse response_list;
-  Registry::call("table", table_name, plugin_request, response_list);
+  auto entry = content->entry;
+  if (entry && entry->plugin) {
+    try {
+      const auto& action = plugin_request.at("action");
+      if (action == "delete") {
+        response_list = entry->plugin->delete_(context, plugin_request);
+      } else if (action == "insert") {
+        response_list = entry->plugin->insert(context, plugin_request);
+      } else if (action == "update") {
+        response_list = entry->plugin->update(context, plugin_request);
+      } else {
+        VLOG(1) << "Invalid xUpdate action for publication table " << table_name
+                << ": " << action;
+        return SQLITE_ERROR;
+      }
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "Exception while updating table " << table_name << ": "
+                 << e.what();
+      setTableErrorMessage(p, e.what());
+      if (!FLAGS_ignore_table_exceptions && pVtab->instance != nullptr) {
+        pVtab->instance->setPendingException(std::current_exception());
+      }
+      return SQLITE_ERROR;
+    } catch (...) {
+      LOG(ERROR) << "Unknown exception while updating table " << table_name;
+      setTableErrorMessage(p, "unknown C++ exception");
+      if (!FLAGS_ignore_table_exceptions && pVtab->instance != nullptr) {
+        pVtab->instance->setPendingException(std::current_exception());
+      }
+      return SQLITE_ERROR;
+    }
+  } else {
+    auto status =
+        Registry::call("table", table_name, plugin_request, response_list);
+    if (!status.ok()) {
+      VLOG(1) << "xUpdate registry call failed: " << status.getMessage();
+      setTableErrorMessage(p, status.getMessage());
+      return SQLITE_ERROR;
+    }
+  }
 
   // Validate the response
   if (response_list.size() != 1) {
@@ -560,12 +672,33 @@ int xUpdate(sqlite3_vtab* p,
   return SQLITE_OK;
 }
 
-int xCreate(sqlite3* db,
-            void* pAux,
+int xUpdate(sqlite3_vtab* p,
             int argc,
-            const char* const* argv,
-            sqlite3_vtab** ppVtab,
-            char** pzErr) {
+            sqlite3_value** argv,
+            sqlite3_int64* pRowid) {
+  try {
+    return xUpdateImpl(p, argc, argv, pRowid);
+  } catch (const std::exception& e) {
+    VLOG(1) << "Exception in xUpdate SQLite callback: " << e.what();
+    setTableErrorMessage(p, e.what());
+    auto* virtual_table = reinterpret_cast<VirtualTable*>(p);
+    if (!FLAGS_ignore_table_exceptions && virtual_table->instance != nullptr) {
+      virtual_table->instance->setPendingException(std::current_exception());
+    }
+    return SQLITE_ERROR;
+  } catch (...) {
+    VLOG(1) << "Unknown exception in xUpdate SQLite callback";
+    setTableErrorMessage(p, "unknown C++ exception");
+    return SQLITE_ERROR;
+  }
+}
+
+int xCreateImpl(sqlite3* db,
+                void* pAux,
+                int argc,
+                const char* const* argv,
+                sqlite3_vtab** ppVtab,
+                char** pzErr) {
   if (argc == 0 || argv[0] == nullptr) {
     return SQLITE_NOMEM;
   }
@@ -575,10 +708,47 @@ int xCreate(sqlite3* db,
   pVtab->content = std::make_shared<VirtualTableContent>();
   pVtab->instance = (SQLiteDBInstance*)pAux;
 
-  // Create a TablePlugin Registry call, expect column details as the response.
   PluginResponse response;
   pVtab->content->name = std::string(argv[0]);
   const auto& name = pVtab->content->name;
+
+  ConstTableEntryPtr publication_entry;
+  if (pVtab->instance != nullptr &&
+      pVtab->instance->publicationSnapshot() != nullptr) {
+    publication_entry = pVtab->instance->publicationSnapshot()->find(name);
+  }
+
+  if (publication_entry && publication_entry->plugin) {
+    try {
+      pVtab->content->entry = publication_entry;
+      pVtab->content->columns = publication_entry->columns;
+      pVtab->content->attributes = publication_entry->attributes;
+
+      auto statement = "CREATE TABLE " + name +
+                       columnDefinition(publication_entry->columns, false);
+      int publication_rc = sqlite3_declare_vtab(db, statement.c_str());
+      if (publication_rc != SQLITE_OK) {
+        LOG(ERROR) << "Error creating published virtual table: " << name << " ("
+                   << publication_rc
+                   << "): " << getStringForSQLiteReturnCode(publication_rc);
+        delete pVtab;
+        return publication_rc;
+      }
+
+      *ppVtab = (sqlite3_vtab*)pVtab;
+      return SQLITE_OK;
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "Exception creating published virtual table " << name
+                 << ": " << e.what();
+      delete pVtab;
+      return SQLITE_ERROR;
+    } catch (...) {
+      LOG(ERROR) << "Unknown exception creating published virtual table "
+                 << name;
+      delete pVtab;
+      return SQLITE_ERROR;
+    }
+  }
 
   // Get the table column information.
   auto status =
@@ -698,21 +868,48 @@ int xCreate(sqlite3* db,
   return rc;
 }
 
-int xColumn(sqlite3_vtab_cursor* cur, sqlite3_context* ctx, int col) {
-  BaseCursor* pCur = (BaseCursor*)cur;
-  const auto* pVtab = (VirtualTable*)cur->pVtab;
-  if (col >= static_cast<int>(pVtab->content->columns.size())) {
-    // Requested column index greater than column set size.
+int xCreate(sqlite3* db,
+            void* pAux,
+            int argc,
+            const char* const* argv,
+            sqlite3_vtab** ppVtab,
+            char** pzErr) {
+  try {
+    return xCreateImpl(db, pAux, argc, argv, ppVtab, pzErr);
+  } catch (const std::exception& e) {
+    VLOG(1) << "Exception in xCreate SQLite callback: " << e.what();
+    return SQLITE_ERROR;
+  } catch (...) {
+    VLOG(1) << "Unknown exception in xCreate SQLite callback";
     return SQLITE_ERROR;
   }
-  if (!pCur->uses_generator && pCur->row >= pCur->rows.size()) {
-    // Request row index greater than row set size.
-    return SQLITE_ERROR;
-  }
+}
 
-  TableRowHolder& row =
-      pCur->uses_generator ? pCur->current : pCur->rows[pCur->row];
-  return row->get_column(ctx, cur->pVtab, col);
+int xColumn(sqlite3_vtab_cursor* cur, sqlite3_context* ctx, int col) {
+  try {
+    BaseCursor* pCur = (BaseCursor*)cur;
+    const auto* pVtab = (VirtualTable*)cur->pVtab;
+    if (col >= static_cast<int>(pVtab->content->columns.size())) {
+      // Requested column index greater than column set size.
+      return SQLITE_ERROR;
+    }
+    if (!pCur->uses_generator && pCur->row >= pCur->rows.size()) {
+      // Request row index greater than row set size.
+      return SQLITE_ERROR;
+    }
+
+    TableRowHolder& row =
+        pCur->uses_generator ? pCur->current : pCur->rows[pCur->row];
+    return row->get_column(ctx, cur->pVtab, col);
+  } catch (const std::exception& e) {
+    VLOG(1) << "Exception in xColumn SQLite callback: " << e.what();
+    sqlite3_result_error(ctx, e.what(), -1);
+    return SQLITE_ERROR;
+  } catch (...) {
+    VLOG(1) << "Unknown exception in xColumn SQLite callback";
+    sqlite3_result_error(ctx, "unknown C++ exception", -1);
+    return SQLITE_ERROR;
+  }
 }
 
 static inline bool sensibleComparison(ColumnType type, unsigned char op) {
@@ -725,7 +922,7 @@ static inline bool sensibleComparison(ColumnType type, unsigned char op) {
   return true;
 }
 
-static int xBestIndex(sqlite3_vtab* tab, sqlite3_index_info* pIdxInfo) {
+static int xBestIndexImpl(sqlite3_vtab* tab, sqlite3_index_info* pIdxInfo) {
   auto* pVtab = (VirtualTable*)tab;
   const auto& columns = pVtab->content->columns;
 
@@ -870,11 +1067,23 @@ static int xBestIndex(sqlite3_vtab* tab, sqlite3_index_info* pIdxInfo) {
   return SQLITE_OK;
 }
 
-static int xFilter(sqlite3_vtab_cursor* pVtabCursor,
-                   int idxNum,
-                   const char* idxStr,
-                   int argc,
-                   sqlite3_value** argv) {
+static int xBestIndex(sqlite3_vtab* tab, sqlite3_index_info* pIdxInfo) {
+  try {
+    return xBestIndexImpl(tab, pIdxInfo);
+  } catch (const std::exception& e) {
+    VLOG(1) << "Exception in xBestIndex SQLite callback: " << e.what();
+    return SQLITE_ERROR;
+  } catch (...) {
+    VLOG(1) << "Unknown exception in xBestIndex SQLite callback";
+    return SQLITE_ERROR;
+  }
+}
+
+static int xFilterImpl(sqlite3_vtab_cursor* pVtabCursor,
+                       int idxNum,
+                       const char* idxStr,
+                       int argc,
+                       sqlite3_value** argv) {
   BaseCursor* pCur = (BaseCursor*)pVtabCursor;
   auto* pVtab = (VirtualTable*)pVtabCursor->pVtab;
   auto content = pVtab->content;
@@ -1044,7 +1253,41 @@ static int xFilter(sqlite3_vtab_cursor* pVtabCursor,
 
   // Generate the row data set.
   plan("Scanning rows for cursor (" + std::to_string(pCur->id) + ")");
-  if (Registry::get().exists("table", pVtab->content->name, true)) {
+  auto publication_entry = content->entry;
+  if (publication_entry && publication_entry->plugin) {
+    auto table = publication_entry->plugin;
+    try {
+      if (table->usesGenerator()) {
+        pCur->uses_generator = true;
+        pCur->generator = std::make_unique<RowGenerator::pull_type>(
+            std::bind(&TablePlugin::generator,
+                      table,
+                      std::placeholders::_1,
+                      std::move(context)));
+        if (*pCur->generator) {
+          pCur->current = pCur->generator->get();
+        }
+        return SQLITE_OK;
+      }
+      pCur->rows = table->generate(context);
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "Exception while executing table " << pVtab->content->name
+                 << ": " << e.what();
+      setTableErrorMessage(pVtabCursor->pVtab, e.what());
+      if (!FLAGS_ignore_table_exceptions && pVtab->instance != nullptr) {
+        pVtab->instance->setPendingException(std::current_exception());
+      }
+      return SQLITE_ERROR;
+    } catch (...) {
+      LOG(ERROR) << "Unknown exception while executing table "
+                 << pVtab->content->name;
+      setTableErrorMessage(pVtabCursor->pVtab, "unknown C++ exception");
+      if (!FLAGS_ignore_table_exceptions && pVtab->instance != nullptr) {
+        pVtab->instance->setPendingException(std::current_exception());
+      }
+      return SQLITE_ERROR;
+    }
+  } else if (Registry::get().exists("table", pVtab->content->name, true)) {
     auto plugin = Registry::get().plugin("table", pVtab->content->name);
     auto table = std::dynamic_pointer_cast<TablePlugin>(plugin);
     try {
@@ -1065,8 +1308,16 @@ static int xFilter(sqlite3_vtab_cursor* pVtabCursor,
       LOG(ERROR) << "Exception while executing table " << pVtab->content->name
                  << ": " << e.what();
       setTableErrorMessage(pVtabCursor->pVtab, e.what());
-      if (!FLAGS_ignore_table_exceptions) {
-        throw;
+      if (!FLAGS_ignore_table_exceptions && pVtab->instance != nullptr) {
+        pVtab->instance->setPendingException(std::current_exception());
+      }
+      return SQLITE_ERROR;
+    } catch (...) {
+      LOG(ERROR) << "Unknown exception while executing table "
+                 << pVtab->content->name;
+      setTableErrorMessage(pVtabCursor->pVtab, "unknown C++ exception");
+      if (!FLAGS_ignore_table_exceptions && pVtab->instance != nullptr) {
+        pVtab->instance->setPendingException(std::current_exception());
       }
       return SQLITE_ERROR;
     }
@@ -1095,12 +1346,44 @@ static int xFilter(sqlite3_vtab_cursor* pVtabCursor,
   return SQLITE_OK;
 }
 
+static int xFilter(sqlite3_vtab_cursor* cursor,
+                   int idxNum,
+                   const char* idxStr,
+                   int argc,
+                   sqlite3_value** argv) {
+  try {
+    return xFilterImpl(cursor, idxNum, idxStr, argc, argv);
+  } catch (const std::exception& e) {
+    VLOG(1) << "Exception in xFilter SQLite callback: " << e.what();
+    if (cursor != nullptr && cursor->pVtab != nullptr) {
+      setTableErrorMessage(cursor->pVtab, e.what());
+      auto* virtual_table = reinterpret_cast<VirtualTable*>(cursor->pVtab);
+      if (!FLAGS_ignore_table_exceptions &&
+          virtual_table->instance != nullptr) {
+        virtual_table->instance->setPendingException(std::current_exception());
+      }
+    }
+    return SQLITE_ERROR;
+  } catch (...) {
+    VLOG(1) << "Unknown exception in xFilter SQLite callback";
+    if (cursor != nullptr && cursor->pVtab != nullptr) {
+      setTableErrorMessage(cursor->pVtab, "unknown C++ exception");
+    }
+    return SQLITE_ERROR;
+  }
+}
+
 struct sqlite3_module* getVirtualTableModule(const std::string& table_name,
-                                             bool extension) {
+                                             bool extension,
+                                             bool published = false) {
   UpgradeLock lock(sqlite_module_map_mutex);
 
   if (sqlite_module_map.find(table_name) != sqlite_module_map.end()) {
-    return &sqlite_module_map[table_name];
+    auto* module = &sqlite_module_map[table_name];
+    if ((extension || published) && module->xUpdate == nullptr) {
+      module->xUpdate = tables::sqlite::xUpdate;
+    }
+    return module;
   }
 
   WriteUpgradeLock wlock(lock);
@@ -1124,6 +1407,8 @@ struct sqlite3_module* getVirtualTableModule(const std::string& table_name,
   // in the TablePlugin class
   if (extension) {
     extension_table_list.insert(table_name);
+  }
+  if (extension || published) {
     sqlite_module_map[table_name].xUpdate = tables::sqlite::xUpdate;
   }
 
@@ -1132,16 +1417,22 @@ struct sqlite3_module* getVirtualTableModule(const std::string& table_name,
 } // namespace sqlite
 } // namespace tables
 
-Status attachTableInternal(const std::string& name,
-                           const SQLiteDBInstanceRef& instance,
-                           bool is_extension) {
-  if (SQLiteDBManager::isDisabled(name)) {
-    VLOG(1) << "Table " << name << " is disabled, not attaching";
-    return Status(0, getStringForSQLiteReturnCode(0));
+namespace {
+
+Status attachTableWithModule(
+    const std::string& name,
+    const SQLiteDBInstanceRef& instance,
+    bool is_extension,
+    bool published,
+    const ConstTableSnapshotPtr& publication_snapshot) {
+  if (publication_snapshot) {
+    instance->setPublicationSnapshot(publication_snapshot);
   }
 
+  RecursiveLock global_attach(kAttachMutex);
+
   struct sqlite3_module* module =
-      tables::sqlite::getVirtualTableModule(name, is_extension);
+      tables::sqlite::getVirtualTableModule(name, is_extension, published);
   if (module == nullptr) {
     VLOG(1) << "Failed to retrieve the virtual table module for \"" << name
             << "\"";
@@ -1169,6 +1460,73 @@ Status attachTableInternal(const std::string& name,
   }
 
   return Status(rc, getStringForSQLiteReturnCode(rc));
+}
+
+} // namespace
+
+Status attachTableInternal(const std::string& name,
+                           const SQLiteDBInstanceRef& instance,
+                           bool is_extension) {
+  if (SQLiteDBManager::isDisabled(name)) {
+    VLOG(1) << "Table " << name << " is disabled, not attaching";
+    return Status(0, getStringForSQLiteReturnCode(0));
+  }
+
+  return attachTableWithModule(name, instance, is_extension, false, nullptr);
+}
+
+Status attachTableInternal(
+    const std::string& name,
+    const SQLiteDBInstanceRef& instance,
+    bool is_extension,
+    std::shared_ptr<const TableSnapshot> publication_snapshot) {
+  if (SQLiteDBManager::isDisabled(name)) {
+    VLOG(1) << "Table " << name << " is disabled, not attaching";
+    return Status(0, getStringForSQLiteReturnCode(0));
+  }
+
+  bool published = publication_snapshot &&
+                   static_cast<bool>(publication_snapshot->find(name));
+  return attachTableWithModule(
+      name, instance, is_extension, published, publication_snapshot);
+}
+
+Status attachTableInternal(const std::string& name,
+                           const SQLiteDBInstanceRef& instance,
+                           std::shared_ptr<TableEntry> entry) {
+  if (SQLiteDBManager::isDisabled(name)) {
+    VLOG(1) << "Table " << name << " is disabled, not attaching";
+    return Status(0, getStringForSQLiteReturnCode(0));
+  }
+
+  auto verification_snapshot = std::make_shared<TableSnapshot>();
+  if (entry) {
+    verification_snapshot->generation = entry->generation;
+    verification_snapshot->tables[name] =
+        std::static_pointer_cast<const TableEntry>(entry);
+  }
+
+  return attachTableWithModule(
+      name, instance, false, static_cast<bool>(entry), verification_snapshot);
+}
+
+Status verifyTableEntryForPublication(
+    const std::shared_ptr<TableEntry>& entry) {
+  if (!entry || entry->name.empty()) {
+    return Status(1, "publication entry has no table name");
+  }
+
+  try {
+    // The default constructor opens a private database but does not run the
+    // full attachVirtualTables registry enumeration.
+    auto verification_db = std::make_shared<SQLiteDBInstance>();
+    return attachTableInternal(entry->name, verification_db, entry);
+  } catch (const std::exception& e) {
+    return Status(1,
+                  std::string("SQLite attach verification threw: ") + e.what());
+  } catch (...) {
+    return Status(1, "SQLite attach verification threw unknown exception");
+  }
 }
 
 Status detachTableInternal(const std::string& name,
@@ -1232,10 +1590,35 @@ void attachVirtualTables(const SQLiteDBInstanceRef& instance) {
 #endif
   }
 
+  // Read the publication exactly once. Every publication virtual table created
+  // by this SQLiteDBInstance therefore belongs to one generation.
+  auto publication_snapshot = TablePublicationRegistry::snapshot();
+  instance->setPublicationSnapshot(publication_snapshot);
+
+  for (const auto& entry_item : publication_snapshot->tables) {
+    const auto& entry = entry_item.second;
+    if (!entry) {
+      continue;
+    }
+
+    auto status =
+        attachTableInternal(entry->name, instance, false, publication_snapshot);
+    if (!status.ok()) {
+      LOG(ERROR) << "Error attaching published table " << entry->name << " ("
+                 << status.getCode() << "): " << status.getMessage();
+    }
+  }
+
   PluginResponse response;
   bool is_extension = false;
 
   for (const auto& name : RegistryFactory::get().names("table")) {
+    // Snapshot-owned names were attached through the fixed-generation entry
+    // path above and must not be attached twice through registry enumeration.
+    if (publication_snapshot->find(name) != nullptr) {
+      continue;
+    }
+
     auto status =
         Registry::call("table", name, {{"action", "columns"}}, response);
     if (!status.ok()) {

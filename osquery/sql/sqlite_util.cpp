@@ -20,6 +20,7 @@
 #include <osquery/logger/logger.h>
 #include <osquery/registry/registry_factory.h>
 #include <osquery/sql/sql.h>
+#include <osquery/sql/table_publication.h>
 
 #include <osquery/utils/conversions/split.h>
 
@@ -384,6 +385,28 @@ RecursiveLock SQLiteDBInstance::attachLock() const {
   return RecursiveLock(attach_mutex_);
 }
 
+void SQLiteDBInstance::setPublicationSnapshot(
+    std::shared_ptr<const TableSnapshot> snapshot) {
+  publication_snapshot_ = std::move(snapshot);
+  snapshot_generation =
+      publication_snapshot_ ? publication_snapshot_->generation : 0U;
+}
+
+std::shared_ptr<const TableSnapshot> SQLiteDBInstance::publicationSnapshot()
+    const {
+  return publication_snapshot_;
+}
+
+void SQLiteDBInstance::setPendingException(std::exception_ptr exception) {
+  pending_exception_ = std::move(exception);
+}
+
+std::exception_ptr SQLiteDBInstance::takePendingException() {
+  auto exception = pending_exception_;
+  pending_exception_ = nullptr;
+  return exception;
+}
+
 void SQLiteDBInstance::addAffectedTable(
     std::shared_ptr<VirtualTableContent> table) {
   // An xFilter/scan was requested for this virtual table.
@@ -667,7 +690,15 @@ Status readRows(sqlite3_stmt* prepared_statement,
   if (prepared_statement == nullptr) {
     return Status::success();
   }
+
+  // A new read must never observe an exception captured by an earlier step.
+  instance->takePendingException();
+
   int rc = sqlite3_step(prepared_statement);
+  if (auto pending_exception = instance->takePendingException()) {
+    sqlite3_finalize(prepared_statement);
+    std::rethrow_exception(pending_exception);
+  }
   /* if we have a result set row... */
   if (SQLITE_ROW == rc) {
     // First collect the column names
@@ -701,6 +732,10 @@ Status readRows(sqlite3_stmt* prepared_statement,
       }
       results.push_back(std::move(row));
       rc = sqlite3_step(prepared_statement);
+      if (auto pending_exception = instance->takePendingException()) {
+        sqlite3_finalize(prepared_statement);
+        std::rethrow_exception(pending_exception);
+      }
     } while (SQLITE_ROW == rc);
   }
   if (rc != SQLITE_DONE) {

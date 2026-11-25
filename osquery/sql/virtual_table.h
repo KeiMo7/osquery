@@ -15,6 +15,7 @@
 
 #include <osquery/core/tables.h>
 #include <osquery/sql/sqlite_util.h>
+#include <osquery/sql/table_publication.h>
 
 namespace osquery {
 
@@ -58,6 +59,9 @@ struct BaseCursor : private boost::noncopyable {
 
   /// Total number of rows.
   size_t n{0};
+
+  /// Whether publication retirement counting acquired this cursor.
+  bool publication_cursor_counted{false};
 };
 
 /**
@@ -81,6 +85,21 @@ struct VirtualTable : private boost::noncopyable {
 Status attachTableInternal(const std::string& name,
                            const SQLiteDBInstanceRef& instance,
                            bool is_extension);
+
+/// Attach one entry from a fixed publication snapshot generation.
+Status attachTableInternal(
+    const std::string& name,
+    const SQLiteDBInstanceRef& instance,
+    bool is_extension,
+    std::shared_ptr<const TableSnapshot> publication_snapshot);
+
+/// Attach a single entry directly. Used by publish-time attach verification.
+Status attachTableInternal(const std::string& name,
+                           const SQLiteDBInstanceRef& instance,
+                           std::shared_ptr<TableEntry> entry);
+
+/// Create a private in-memory database and prove an entry can be attached.
+Status verifyTableEntryForPublication(const std::shared_ptr<TableEntry>& entry);
 
 /// Detach (drop) a table.
 Status detachTableInternal(const std::string& name,
